@@ -29,6 +29,23 @@ HORIZON_DAYS = 14
 MIN_EDGE = 0.05
 
 
+def preflight():
+    """Fail loudly and usefully if a committed data file is missing. The import guard in
+    the workflow cannot see this, because these are read at run time, not import time."""
+    need = {FIGHTS: "data/fights_clean.csv", ATTRS: "data/attrs.csv",
+            os.path.join(HERE, "spec.json"): "spec.json"}
+    missing = [name for path, name in need.items() if not os.path.exists(path)]
+    if missing:
+        print("MISSING REQUIRED FILES:")
+        for m in missing:
+            print(f"  {m}")
+        print("\nThese ship with the repo and are not generated at run time. If you")
+        print("uploaded through the GitHub web interface, select the folders rather than")
+        print("individual files, or the data/ subfolder is dropped silently.")
+        print(f"\nrepo root currently contains: {sorted(os.listdir(HERE))}")
+        sys.exit(1)
+
+
 def min_odds(p):
     p = min(max(float(p), 0.01), 0.99)
     return math.ceil((1 + MIN_EDGE) / p * 100) / 100.0
@@ -136,6 +153,7 @@ def fetch_upcoming(today):
 
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
+    preflight()
     F = refresh_results()
     A = E.load_attrs(ATTRS)
     up = fetch_upcoming(today)
