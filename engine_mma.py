@@ -59,7 +59,12 @@ def prepare(F, attrs):
     F["y"] = (F.A == F.n1).astype(int)
     F["wt"] = F.weight.fillna("").str.replace(r"\s*\(.*", "", regex=True).str.strip()
     F["hw"] = F.wt.str.contains("Heavyweight", case=False, na=False).astype(int)
-    F["meth"] = np.where(F.ko, "KO", np.where(F["sub"], "SUB", "DEC"))
+    # A scheduled fight has no result. Its alphabetical orientation still produces a
+    # valid-looking y, so it must be flagged or the state engine will update ratings
+    # from a fabricated outcome before the fight has happened.
+    F["pending"] = F["m"].eq("PENDING") if "m" in F.columns else False
+    F["meth"] = np.where(F.pending, "PENDING",
+                         np.where(F.ko, "KO", np.where(F["sub"], "SUB", "DEC")))
     return F.sort_values(["date", "event"]).reset_index(drop=True)
 
 
@@ -102,7 +107,7 @@ def build(F, attrs, cfg):
             "b_kow": sb["ko_w"].rate(TAU), "b_subw": sb["sub_w"].rate(TAU),
             "b_decw": sb["dec_w"].rate(TAU), "b_kol": sb["ko_l"].rate(TAU),
             "b_subl": sb["sub_l"].rate(TAU)})
-        if r.y != r.y or not np.isfinite(r.y):
+        if getattr(r, "pending", False) or r.y != r.y or not np.isfinite(r.y):
             continue
         w, l = (r.A, r.B) if r.y == 1 else (r.B, r.A)
         e = 1.0 / (1.0 + 10 ** (-(elo[w] - elo[l]) / 400.0))
@@ -131,6 +136,7 @@ def orient(D, winner):
 
 
 def fit_heads(D, tr, C):
+    tr = tr & (~D.meth.eq("PENDING"))
     scw = StandardScaler().fit(D.loc[tr, WIN].values)
     mw = LogisticRegression(C=C, max_iter=3000).fit(
         scw.transform(D.loc[tr, WIN].values), D.loc[tr, "y"].values)

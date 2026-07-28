@@ -74,27 +74,30 @@ def parse_bouts(txt):
     return out
 
 
-rows, empty = [], []
-with gzip.open(RAW, "rt") as fh:
-    for line in fh:
-        e = json.loads(line)
-        b = parse_bouts(e["wikitext"])
-        if not b:
-            empty.append((e["promotion"], e["date"][:4], e["event"], len(e["wikitext"])))
-        for x in b:
-            rows.append({**x, "event": e["event"], "promotion": e["promotion"], "date": e["date"]})
+if __name__ == "__main__":
+    # Only runs when invoked directly. The daily runner imports the
+    # parsing helpers above and must not trigger a full re-parse.
+    rows, empty = [], []
+    with gzip.open(RAW, "rt") as fh:
+        for line in fh:
+            e = json.loads(line)
+            b = parse_bouts(e["wikitext"])
+            if not b:
+                empty.append((e["promotion"], e["date"][:4], e["event"], len(e["wikitext"])))
+            for x in b:
+                rows.append({**x, "event": e["event"], "promotion": e["promotion"], "date": e["date"]})
 
-F = pd.DataFrame(rows)
-F["date"] = pd.to_datetime(F.date)
-F.to_csv(os.path.join(OUT, "fights_raw.csv"), index=False)
-print(f"bouts parsed: {len(F)}")
-print(F.promotion.value_counts().to_string())
-print()
-Z = pd.DataFrame(empty, columns=["promo", "year", "event", "bytes"])
-print(f"events yielding nothing: {len(Z)}  (page missing: {(Z.bytes==0).sum()}, "
-      f"page present but no template: {(Z.bytes>0).sum()})")
-print(Z[Z.bytes > 0].groupby("promo").size().to_string())
-print()
-u = F[F.promotion == "UFC"]
-print("UFC bouts by year:")
-print(u.groupby(u.date.dt.year).size().tail(18).to_string())
+    F = pd.DataFrame(rows)
+    F["date"] = pd.to_datetime(F.date)
+    F.to_csv(os.path.join(OUT, "fights_raw.csv"), index=False)
+    print(f"bouts parsed: {len(F)}")
+    print(F.promotion.value_counts().to_string())
+    print()
+    Z = pd.DataFrame(empty, columns=["promo", "year", "event", "bytes"])
+    print(f"events yielding nothing: {len(Z)}  (page missing: {(Z.bytes==0).sum()}, "
+          f"page present but no template: {(Z.bytes>0).sum()})")
+    print(Z[Z.bytes > 0].groupby("promo").size().to_string())
+    print()
+    u = F[F.promotion == "UFC"]
+    print("UFC bouts by year:")
+    print(u.groupby(u.date.dt.year).size().tail(18).to_string())

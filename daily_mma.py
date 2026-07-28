@@ -153,9 +153,8 @@ def run(today_str):
     G["is_title"] = G.is_title.fillna(False)
     G["sched"] = pd.to_numeric(G.sched, errors="coerce").fillna(3)
     P = E.prepare(G, A)
-    P["pending"] = P.m.eq("PENDING")
-    D = E.build(P[~P.pending].copy(), A, CFG)          # states from settled bouts only
-    # re-run including pending rows so they inherit the final states
+    # One pass. prepare() flags pending rows and build() skips their state updates, so
+    # scheduled fights read the current ratings without contributing to them.
     Dall = E.build(P, A, CFG)
     tr = (Dall.date.dt.year <= TRAIN_THROUGH) & (~Dall.pending)
     heads = E.fit_heads(Dall, tr, C)
