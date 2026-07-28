@@ -181,14 +181,21 @@ def run(today_str):
     os.makedirs(LOGS, exist_ok=True)
     pred_path = os.path.join(LOGS, "predictions.csv")
     log = pd.read_csv(pred_path, dtype={"fight_id": str}) if os.path.exists(pred_path) else \
-        pd.DataFrame(columns=["date", "fight_id", "event", "A", "B", "p_win_a",
+        pd.DataFrame(columns=["date", "fight_id", "event", "A", "B", "p_win_a", "p_elo",
                               "p_distance", "p_a_ko", "p_a_sub", "p_a_dec",
                               "p_b_ko", "p_b_sub", "p_b_dec", "model"])
 
     board = Dall[Dall.pending].copy()
     if len(board):
         pr = E.predict(heads, board)
-        b = board[["fight_id", "event", "A", "B", "wt", "sched"]].copy()
+        b = board[["fight_id", "event", "wt", "sched"]].copy()
+        # Title-cased for the board and the dashboard; grading re-normalises, so either
+        # casing joins correctly.
+        b["A"] = board.A.str.title().values
+        b["B"] = board.B.str.title().values
+        # The Elo floor is what the dashboard grades the model against. Without it the
+        # MMA tab has no baseline to draw.
+        b["p_elo"] = 1 / (1 + 10 ** (-board.elo_d.values / 400))
         b["date"] = board.date.dt.strftime("%Y-%m-%d")
         for c in pr.columns:
             b[c] = pr[c].values
@@ -219,7 +226,7 @@ def run(today_str):
         a, bb = sorted([E.norm_name(r.f1), E.norm_name(r.f2)])
         won[f"{a}|{bb}"] = (1.0 if E.norm_name(r.f1) == a else 0.0, bool(r.distance))
     def grade(row):
-        a, bb = sorted([str(row.A), str(row.B)])
+        a, bb = sorted([E.norm_name(row.A), E.norm_name(row.B)])
         return won.get(f"{a}|{bb}", (np.nan, np.nan))
     g = log.apply(grade, axis=1, result_type="expand")
     log["result"], log["went_dist"] = g[0], g[1]
