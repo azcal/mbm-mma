@@ -1,0 +1,11 @@
+{
+ "cfg": {
+  "K": 32,
+  "hl": 9,
+  "tau": 2.0,
+  "finish_bonus": 1.25
+ },
+ "C": 0.05,
+ "train_through": 2025,
+ "note": "tuned on 2018-2025 walk-forward; 2026 opened once"
+}
