@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import engine_mma as E
 import tg_delta
+import board_format as BF
 
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
@@ -211,9 +212,8 @@ def run(today_str):
                         (r.p_a_dec, f"{r.A} by decision"), (r.p_b_ko, f"{r.B} by KO/TKO"),
                         (r.p_b_sub, f"{r.B} by sub"), (r.p_b_dec, f"{r.B} by decision")])
             print(f"    METH most likely: {best[1]} {best[0]:.3f} -> needs {min_odds(best[0]):.2f}")
-            rows.append({"line": f"{r.A} vs {r.B}: {fav} {pf:.3f} >= {min_odds(pf):.2f} | "
-                                 f"dist {r.p_distance:.3f} >= {min_odds(r.p_distance):.2f}",
-                         "min_odds": min_odds(pf), "fight_id": r.fight_id})
+            rows.append({"date": r.date, "game": f"{r.A} vs {r.B}", "pick": fav,
+                         "p": pf, "fight_id": r.fight_id})
         keep = [c for c in log.columns if c in b.columns]
         log = pd.concat([log[~log.fight_id.isin(b.fight_id)], b[keep]], ignore_index=True)
     else:
@@ -259,10 +259,24 @@ def run(today_str):
 
     tg, ch = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT")
     if tg and ch:
-        push = {r["fight_id"]: {"line": r["line"], "min_odds": r["min_odds"]} for r in rows}
+        push, skipped = {}, 0
+        if rows:
+            wg = max([len(r["game"]) for r in rows] + [10])
+            wp = max([len(r["pick"]) for r in rows] + [8])
+            for r in rows:
+                if BF.min_odds(r["p"]) < BF.PRICE_FLOOR:
+                    skipped += 1
+                    continue
+                push[r["fight_id"]] = {
+                    "line": BF.line(r["date"], r["game"], r["pick"], r["p"],
+                                    w_game=wg, w_pick=wp),
+                    "min_odds": BF.min_odds(r["p"])}
         mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
         if lines or alerts:
             txt = "\n".join(lines) if lines else "no price changes since the last push"
+            if skipped:
+                txt += f"\n({skipped} fight{'s' if skipped != 1 else ''} skipped, "\
+                       f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})"
             if mode == "delta" and lines:
                 txt = "changes since the last push:\n" + txt
             if alerts:
