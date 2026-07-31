@@ -202,7 +202,6 @@ def run(today_str):
         for c in pr.columns:
             b[c] = pr[c].values
         b["model"] = "v1"
-        print(f"\n=== MBM MMA board ({len(b)} fights) ===")
         for _, r in b.sort_values(["date", "event"]).iterrows():
             fav, pf = (r.A, r.p_win_a) if r.p_win_a >= .5 else (r.B, 1-r.p_win_a)
             print(f"{r.date} {r.A} vs {r.B} ({r.wt}, {int(r.sched)}r)")
@@ -274,6 +273,13 @@ def run(today_str):
                 block = [f"{r['date']}  {r['game']}"] + r.get("combo", [])
                 push[r["fight_id"]] = {"line": "\n".join(block),
                                        "min_odds": BF.min_odds(r["p"])}
+        print("\n=== MBM MMA board ===")
+        for _v in push.values():
+            print(_v["line"])
+        if skipped:
+            print(f"({skipped} fight{{'s' if skipped != 1 else ''}} skipped, "
+                  f"price floor {{BF.PRICE_FLOOR:.2f}} / {{BF.american(BF.PRICE_FLOOR)}})")
+
         mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
         if lines or alerts:
             body = list(lines) if lines else ["no price changes since the last push"]
