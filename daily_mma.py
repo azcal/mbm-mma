@@ -15,6 +15,7 @@ sys.path.insert(0, HERE)
 import engine_mma as E
 import tg_delta
 import board_format as BF
+import notify
 
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
@@ -208,12 +209,14 @@ def run(today_str):
             print(f"    ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}")
             print(f"    DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
                   f"   |   inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
-            best = max([(r.p_a_ko, f"{r.A} by KO/TKO"), (r.p_a_sub, f"{r.A} by sub"),
-                        (r.p_a_dec, f"{r.A} by decision"), (r.p_b_ko, f"{r.B} by KO/TKO"),
-                        (r.p_b_sub, f"{r.B} by sub"), (r.p_b_dec, f"{r.B} by decision")])
-            print(f"    METH most likely: {best[1]} {best[0]:.3f} -> needs {min_odds(best[0]):.2f}")
+            for ln in BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
+                                   r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B):
+                print("  " + ln)
             rows.append({"date": r.date, "game": f"{r.A} vs {r.B}", "pick": fav,
-                         "p": pf, "fight_id": r.fight_id})
+                         "p": pf, "fight_id": r.fight_id,
+                         "combo": BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
+                                               r.p_b_ko, r.p_b_sub, r.p_b_dec,
+                                               r.A, r.B)})
         keep = [c for c in log.columns if c in b.columns]
         log = pd.concat([log[~log.fight_id.isin(b.fight_id)], b[keep]], ignore_index=True)
     else:
@@ -257,8 +260,7 @@ def run(today_str):
                 alerts.append("MMA moneyline")
         dec.to_csv(os.path.join(LOGS, "graded.csv"), index=False)
 
-    tg, ch = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT")
-    if tg and ch:
+    if True:
         push, skipped = {}, 0
         if rows:
             wg = max([len(r["game"]) for r in rows] + [10])
@@ -267,22 +269,25 @@ def run(today_str):
                 if BF.min_odds(r["p"]) < BF.PRICE_FLOOR:
                     skipped += 1
                     continue
-                push[r["fight_id"]] = {
-                    "line": BF.line(r["date"], r["game"], r["pick"], r["p"],
-                                    w_game=wg, w_pick=wp),
-                    "min_odds": BF.min_odds(r["p"])}
+                # Three lines per fight: moneyline lean, distance lean, and the two as a
+                # same-game parlay, which books post as one ticket.
+                block = [f"{r['date']}  {r['game']}"] + r.get("combo", [])
+                push[r["fight_id"]] = {"line": "\n".join(block),
+                                       "min_odds": BF.min_odds(r["p"])}
         mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
         if lines or alerts:
-            txt = "\n".join(lines) if lines else "no price changes since the last push"
-            if skipped:
-                txt += f"\n({skipped} fight{'s' if skipped != 1 else ''} skipped, "\
-                       f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})"
-            if mode == "delta" and lines:
-                txt = "changes since the last push:\n" + txt
+            body = list(lines) if lines else ["no price changes since the last push"]
+            foot = (f"{skipped} fight{'s' if skipped != 1 else ''} skipped, "
+                    f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
+                   if skipped else None
+            title = "MBM MMA" + (" · changes since the last push"
+                                 if mode == "delta" and lines else "")
+            colour = notify.GREEN
             if alerts:
-                txt += "\n\u26a0 TRIPWIRE: " + ", ".join(alerts) + " below base rate, stop betting this board"
-            requests.post(f"https://api.telegram.org/bot{tg}/sendMessage",
-                          data={"chat_id": ch, "text": f"MBM MMA\n{txt}"}, timeout=20)
+                body = body + ["", "TRIPWIRE: " + ", ".join(alerts)
+                               + " below base rate, stop betting this board"]
+                colour = notify.RED
+            notify.send(title, body, foot, colour)
 
 
 if __name__ == "__main__":
