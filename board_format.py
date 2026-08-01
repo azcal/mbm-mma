@@ -1,5 +1,5 @@
 """
-One board line, one format, every sport, Telegram and dashboard.
+One board line, one format, every sport, Discord and dashboard.
 
     2026-09-14  KC @ LAC        LAC +2.5        find 1.91 / -110 or better
 
@@ -8,6 +8,10 @@ is the same min_odds rule every board already uses, shown in decimal and America
 be compared to whatever a book displays without conversion.
 """
 import math
+
+# Bumped whenever this file changes. Every runner asserts on it at import, so a repo
+# holding an old copy fails in the workflow's import guard instead of rendering wrong.
+VERSION = "2026-08-01"
 
 MIN_EDGE = 0.05
 
@@ -74,7 +78,7 @@ def spread_pick(home, away, line_margin):
 
 
 def widths(games, picks):
-    """Column widths that fit the slate, so a board never ragged-wraps in Telegram."""
+    """Column widths that fit the slate, so a board never ragged-wraps."""
     return (max([len(g) for g in games] + [10]),
             max([len(p) for p in picks] + [8]))
 
@@ -155,9 +159,23 @@ def mma_board(p_a_ko, p_a_sub, p_a_dec, p_b_ko, p_b_sub, p_b_dec, a, b,
 LIVE_MAX = 1.50
 TRAP_DROP = 0.10
 LIVE_WINDOWS = {
-    "NBA": ("Q1", [(-11, -7, 1.72, 1.96), (-7, -3, 1.67, 1.88), (-3, 0, 1.46, 1.61)]),
-    "NFL": ("Q1", [(-10, -7, 2.00, 2.35), (-7, -3, 1.66, 1.87), (-3, 0, 1.36, 1.49)]),
+    "NBA":   ("Q1", [(-11, -7, 1.72, 1.96), (-7, -3, 1.67, 1.88), (-3, 0, 1.46, 1.61)]),
+    "NFL":   ("Q1", [(-10, -7, 2.00, 2.35), (-7, -3, 1.66, 1.87), (-3, 0, 1.36, 1.49)]),
+    "NCAAF": ("Q1", [(-14, -7, 1.96, 2.29), (-7, -3, 1.49, 1.65), (-3, 0, 1.36, 1.48)]),
+    "WNBA":  ("Q1", [(-9, -5, 1.69, 1.91), (-5, 0, 1.65, 1.86)]),
 }
+
+# Measured and rejected. These are findings about the sports, not gaps in the build.
+#
+#   NHL     down two after one period: 46.1%. Down three: 31.6%. Only the one-goal row
+#           cleared 50% and its window was two cents wide.
+#   Soccer  down one at half: 35.9%. Down two: 12.0%. Only level-at-half survived.
+#   CS2     favourite losing map one wins the series 38.9% across 558 best-of-threes.
+#           A Bo3 turns map one into a near-elimination.
+#   MMA     no scoreboard between rounds. Judging is not observable mid-fight.
+#
+# The pattern: comebacks are live where scoring is frequent and continuous, and dead where
+# it is rare (hockey, soccer) or where the format segments into must-wins (CS2).
 
 
 def live_note(sport, p_pre, indent="      "):
@@ -167,8 +185,8 @@ def live_note(sport, p_pre, indent="      "):
     not betting the opener, you are waiting for a price the scoreboard creates. Returns []
     where the sport has no measured window or the pregame price is long enough to just take.
 
-    WNBA and NHL are absent deliberately. NHL collapsed to a single one-goal window under
-    the 50% floor, and WNBA has not been rebuilt from its production model yet.
+    NHL, Soccer, CS2 and MMA are absent because they were measured and did not qualify.
+    See the note above LIVE_WINDOWS.
     """
     if sport not in LIVE_WINDOWS or min_odds(p_pre) >= LIVE_MAX:
         return []

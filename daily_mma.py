@@ -4,7 +4,7 @@ MBM MMA daily runner (rebuild v1, frozen spec).
 - Pulls upcoming UFC cards from ESPN, the only source that lists fights before they happen
 - Boards three markets: moneyline, goes-the-distance, and winner by method
 - Grades logged forecasts, prints rolling metrics, last-200 tripwire
-- Telegram push routed through tg_delta so refreshes only report what moved
+- Discord push routed through tg_delta so refreshes only report what moved
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
 import argparse, json, math, os, re, sys, time, datetime as dt
@@ -17,6 +17,17 @@ import tg_delta
 import board_format as BF
 import notify
 
+# A stale copy of a shared file shows up as a wrong-looking board or an AttributeError
+# halfway through a run. This turns it into a named failure in the workflow's import
+# guard, which takes seconds. Bump all four together when a shared file changes.
+SHARED_VERSION = "2026-08-01"
+for _mod in (BF, notify, tg_delta):
+    _have = getattr(_mod, "VERSION", None)
+    if _have != SHARED_VERSION:
+        raise ImportError(
+            f"{_mod.__name__}.py is version {_have!r}, this runner needs "
+            f"{SHARED_VERSION!r}. Copy the current shared files into this repo.")
+
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
 WH = {"User-Agent": "MBM-forecasting/1.0 (contact: maparsons4@gmail.com)"}
@@ -27,7 +38,10 @@ LOGS = os.path.join(HERE, "logs")
 SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_THROUGH = SPEC["train_through"]
-HORIZON_DAYS = 14
+# Cards are announced weeks out but only firm up in the last few days, and everything
+# beyond the imminent card is noise on a board pushed daily. Five days covers Friday
+# evening through the following Wednesday from any run.
+HORIZON_DAYS = 5
 MIN_EDGE = 0.05
 
 
@@ -208,14 +222,12 @@ def run(today_str):
             print(f"    ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}")
             print(f"    DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
                   f"   |   inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
-            for ln in BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
-                                   r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B):
+            combo = BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
+                                 r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B)
+            for ln in combo:
                 print("  " + ln)
             rows.append({"date": r.date, "game": f"{r.A} vs {r.B}", "pick": fav,
-                         "p": pf, "fight_id": r.fight_id,
-                         "combo": BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
-                                               r.p_b_ko, r.p_b_sub, r.p_b_dec,
-                                               r.A, r.B)})
+                         "p": pf, "fight_id": r.fight_id, "combo": combo})
         keep = [c for c in log.columns if c in b.columns]
         log = pd.concat([log[~log.fight_id.isin(b.fight_id)], b[keep]], ignore_index=True)
     else:
@@ -259,42 +271,49 @@ def run(today_str):
                 alerts.append("MMA moneyline")
         dec.to_csv(os.path.join(LOGS, "graded.csv"), index=False)
 
-    if True:
-        push, skipped = {}, 0
-        if rows:
-            wg = max([len(r["game"]) for r in rows] + [10])
-            wp = max([len(r["pick"]) for r in rows] + [8])
-            for r in rows:
-                if BF.min_odds(r["p"]) < BF.PRICE_FLOOR:
-                    skipped += 1
-                    continue
-                # Three lines per fight: moneyline lean, distance lean, and the two as a
-                # same-game parlay, which books post as one ticket.
-                block = [f"{r['date']}  {r['game']}"] + r.get("combo", [])
-                push[r["fight_id"]] = {"line": "\n".join(block),
-                                       "min_odds": BF.min_odds(r["p"])}
-        print("\n=== MBM MMA board ===")
-        for _v in push.values():
-            print(_v["line"])
-        if skipped:
-            print(f"({skipped} fight{{'s' if skipped != 1 else ''}} skipped, "
-                  f"price floor {{BF.PRICE_FLOOR:.2f}} / {{BF.american(BF.PRICE_FLOOR)}})")
+    push, skipped = {}, 0
+    if rows:
+        for r in rows:
+            if BF.min_odds(r["p"]) < BF.PRICE_FLOOR:
+                skipped += 1
+                continue
+            # Three lines per fight: moneyline lean, distance lean, and the two as a
+            # same-game parlay, which books post as one ticket.
+            combo = r.get("combo") or []
+            if not combo:
+                skipped += 1
+                continue
+            block = [f"{r['date']}  {r['game']}"] + combo
+            push[r["fight_id"]] = {"line": "\n".join(block),
+                                   "min_odds": BF.min_odds(r["p"]),
+                                   # Lets the gate report a replaced opponent under the
+                                   # same ESPN id, which a price move alone can miss.
+                                   "match": r["game"]}
+    print("\n=== MBM MMA board ===")
+    for _v in push.values():
+        print(_v["line"])
+    if skipped:
+        print(f"({skipped} fight{'s' if skipped != 1 else ''} skipped, "
+              f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})")
 
-        mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
-        if lines or alerts:
-            body = list(lines) if lines else ["no price changes since the last push"]
-            foot = (f"{skipped} fight{'s' if skipped != 1 else ''} skipped, "
-                    f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
-                   if skipped else None
-            title = "MBM MMA" + (" · changes since the last push"
-                                 if mode == "delta" and lines else "")
-            colour = notify.GREEN
-            if alerts:
-                body = body + ["", "TRIPWIRE: " + ", ".join(alerts)
-                               + " below base rate, stop betting this board"]
-                colour = notify.RED
-            notify.send(title, body, foot, colour)
-
+    mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
+    if lines or alerts:
+        body = list(lines) if lines else ["no price changes since the last push"]
+        foot = (f"{skipped} fight{'s' if skipped != 1 else ''} skipped, "
+                f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
+               if skipped else None
+        title = "MBM MMA" + (" · changes since the last push"
+                             if mode == "delta" and lines else "")
+        colour = notify.GREEN
+        if alerts:
+            body = body + ["", "TRIPWIRE: " + ", ".join(alerts)
+                           + " below base rate, stop betting this board"]
+            colour = notify.RED
+        notify.send(title, body, foot, colour)
+    elif not push:
+        print("no board to send")
+    else:
+        print("board unchanged since the last push, nothing sent")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
