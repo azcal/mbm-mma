@@ -20,7 +20,7 @@ import notify
 # A stale copy of a shared file shows up as a wrong-looking board or an AttributeError
 # halfway through a run. This turns it into a named failure in the workflow's import
 # guard, which takes seconds. Bump all four together when a shared file changes.
-SHARED_VERSION = "2026-08-01"
+SHARED_VERSION = "2026-08-02"
 for _mod in (BF, notify, tg_delta):
     _have = getattr(_mod, "VERSION", None)
     if _have != SHARED_VERSION:
