@@ -19,14 +19,16 @@ import notify
 
 # A stale copy of a shared file shows up as a wrong-looking board or an AttributeError
 # halfway through a run. This turns it into a named failure in the workflow's import
-# guard, which takes seconds. Bump all four together when a shared file changes.
-SHARED_VERSION = "2026-08-02"
+# guard, which takes seconds. A minimum rather than an exact match, so a later
+# improvement to a shared file does not force an edit here; raise it only for a change
+# this runner depends on.
+SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
 for _mod in (BF, notify, tg_delta):
-    _have = getattr(_mod, "VERSION", None)
-    if _have != SHARED_VERSION:
+    _have = getattr(_mod, "VERSION", "")
+    if _have < SHARED_MIN:
         raise ImportError(
-            f"{_mod.__name__}.py is version {_have!r}, this runner needs "
-            f"{SHARED_VERSION!r}. Copy the current shared files into this repo.")
+            f"{_mod.__name__}.py is version {_have or 'unstamped'}, this runner needs "
+            f"{SHARED_MIN} or newer. Copy the current shared files into this repo.")
 
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
