@@ -44,7 +44,10 @@ TRAIN_THROUGH = SPEC["train_through"]
 # beyond the imminent card is noise on a board pushed daily. Five days covers Friday
 # evening through the following Wednesday from any run.
 HORIZON_DAYS = 5
-MIN_EDGE = 0.05
+# Tracks board_format rather than restating it. This is the console-side copy, and a
+# local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
+# quoted different prices for the same game.
+MIN_EDGE = BF.MIN_EDGE
 
 
 def preflight():
