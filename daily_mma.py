@@ -240,13 +240,25 @@ def run(today_str):
 
     # ---- grade ----
     res = F.assign(k=F.f1.map(E.norm_name) + "|" + F.f2.map(E.norm_name))
+    # Keyed on the sorted pair so either fighter order finds the bout, but the value
+    # stored is the WINNER'S name rather than a flag. The previous version stored
+    # "1.0 if the winner sorts first", and `result` is paired with p_win_a, which is
+    # P(row.A wins). Those only agree while row.A is always the alphabetically first
+    # name. It is, in all 329 logged rows, so nothing has been graded wrongly yet, but
+    # the day an upstream feed lists a bout the other way round, half the grades invert
+    # silently and the board reads 50% forever.
     won = {}
     for r in res.itertuples():
         a, bb = sorted([E.norm_name(r.f1), E.norm_name(r.f2)])
-        won[f"{a}|{bb}"] = (1.0 if E.norm_name(r.f1) == a else 0.0, bool(r.distance))
+        won[f"{a}|{bb}"] = (E.norm_name(r.f1), bool(r.distance))
+
     def grade(row):
         a, bb = sorted([E.norm_name(row.A), E.norm_name(row.B)])
-        return won.get(f"{a}|{bb}", (np.nan, np.nan))
+        hit = won.get(f"{a}|{bb}")
+        if hit is None:
+            return (np.nan, np.nan)
+        winner, dist = hit
+        return (1.0 if winner == E.norm_name(row.A) else 0.0, dist)
     g = log.apply(grade, axis=1, result_type="expand")
     log["result"], log["went_dist"] = g[0], g[1]
     log.to_csv(pred_path, index=False)
@@ -291,9 +303,15 @@ def run(today_str):
             block = [f"{r['date']}  {r['game']}"] + combo
             push[r["fight_id"]] = {"line": "\n".join(block),
                                    "min_odds": BF.min_odds(r["p"]),
-                                   # Lets the gate report a replaced opponent under the
-                                   # same ESPN id, which a price move alone can miss.
-                                   "match": r["game"]}
+                                   # Carries BOTH the matchup and the side. The matchup
+                                   # alone catches a replaced opponent under the same ESPN
+                                   # id but is blind to the model changing its mind: on a
+                                   # near-even fight the side can flip while the price
+                                   # moves less than the delta tolerance, so the channel
+                                   # keeps showing the old fighter while the log holds the
+                                   # new one. That is how a published pick and a graded
+                                   # pick came apart on 2026-08-04.
+                                   "match": f"{r['pick']} in {r['game']}"}
     print("\n=== MBM MMA board ===")
     for _v in push.values():
         print(_v["line"])
