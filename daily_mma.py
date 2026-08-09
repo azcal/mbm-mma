@@ -7,7 +7,7 @@ MBM MMA daily runner (rebuild v1, frozen spec).
 - Discord push routed through tg_delta so refreshes only report what moved
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
-import argparse, json, math, os, re, sys, time, datetime as dt
+import argparse, difflib, json, math, os, re, sys, time, datetime as dt
 import numpy as np, pandas as pd, requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -247,20 +247,76 @@ def run(today_str):
     # name. It is, in all 329 logged rows, so nothing has been graded wrongly yet, but
     # the day an upstream feed lists a bout the other way round, half the grades invert
     # silently and the board reads 50% forever.
-    won = {}
+    # Exact key first: the sorted normalised pair. The value stored is the WINNER'S name
+    # rather than a flag, because `result` is paired with p_win_a, which is P(row.A wins),
+    # and a "did the first-sorting name win" flag only agrees with that while row.A
+    # happens to sort first.
+    won, keys = {}, []
     for r in res.itertuples():
         a, bb = sorted([E.norm_name(r.f1), E.norm_name(r.f2)])
-        won[f"{a}|{bb}"] = (E.norm_name(r.f1), bool(r.distance))
+        k = f"{a}|{bb}"
+        won[k] = (E.norm_name(r.f1), bool(r.distance))
+        keys.append(k)
+
+    def close_key(k):
+        """Nearest result key, for a bout whose names differ between the two sources.
+
+        The board takes names from ESPN and results from Wikipedia, and they disagree
+        often enough to matter: Jessie against Jesse, Billy against Bill, a surname
+        carrying an extra component on one side. An exact key misses all of those and the
+        fight sits ungraded forever with nothing said.
+
+        Requires a high similarity AND a clear gap to the runner-up, so a near-miss on one
+        card cannot be resolved to a different bout.
+        """
+        best = difflib.get_close_matches(k, keys, n=2, cutoff=0.85)
+        if not best:
+            return None
+        if len(best) > 1:
+            r1 = difflib.SequenceMatcher(None, k, best[0]).ratio()
+            r2 = difflib.SequenceMatcher(None, k, best[1]).ratio()
+            if r1 - r2 < 0.05:
+                return None
+        return best[0]
+
+    fuzzy = []
 
     def grade(row):
         a, bb = sorted([E.norm_name(row.A), E.norm_name(row.B)])
-        hit = won.get(f"{a}|{bb}")
+        k = f"{a}|{bb}"
+        hit = won.get(k)
         if hit is None:
-            return (np.nan, np.nan)
+            alt = close_key(k)
+            if alt is None:
+                return (np.nan, np.nan)
+            hit = won[alt]
+            fuzzy.append(f"{row.A} vs {row.B} -> {alt.replace('|', ' vs ')}")
         winner, dist = hit
-        return (1.0 if winner == E.norm_name(row.A) else 0.0, dist)
+        # Compare the winner to row.A directly rather than to whichever name sorts first.
+        na, nb = E.norm_name(row.A), E.norm_name(row.B)
+        if winner == na:
+            return (1.0, dist)
+        if winner == nb:
+            return (0.0, dist)
+        # Matched fuzzily, so the winner string may be a variant of either name.
+        return (1.0 if difflib.SequenceMatcher(None, winner, na).ratio()
+                > difflib.SequenceMatcher(None, winner, nb).ratio() else 0.0, dist)
+
     g = log.apply(grade, axis=1, result_type="expand")
+    if fuzzy:
+        print(f"graded {len(fuzzy)} bout(s) by nearest name match, check these look right:")
+        for f in fuzzy[:6]:
+            print(f"   {f}")
     log["result"], log["went_dist"] = g[0], g[1]
+    # Anything past its date and still ungraded. Silence here used to mean the bout simply
+    # never appeared in the rolling metrics, with nothing to say why.
+    _cut = (pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=2))
+    _stale = log[log.result.isna() & (pd.to_datetime(log.date, errors="coerce") < _cut)]
+    if len(_stale):
+        print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
+              f"result:")
+        for _, _r in _stale.sort_values("date").tail(8).iterrows():
+            print(f"   {_r.date}  {_r.A} vs {_r.B}")
     log.to_csv(pred_path, index=False)
     dec = log[log.result.isin([0.0, 1.0])]
     if len(dec) >= 30:
