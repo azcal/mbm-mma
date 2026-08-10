@@ -226,11 +226,13 @@ def run(today_str):
     # Freshness. MMA never wired this before: freshness.py sat in the repo unused, so the
     # board priced fights with no check that the Wikipedia results history was current.
     # ESPN's mma/ufc scoreboard lists completed cards, so probe it against the newest bout
-    # the history holds. Weekly cards -> grace 7. season_types=None because UFC events do
-    # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
-    # what require("freshness") verifies actually ran.
+    # the history holds. grace 40: measured 295 UFC event days since 2022 -- median gap 6,
+    # but the holiday break after 2025-12-20 ran 35 days with 29 gaps over a week, so a
+    # shorter grace would block a healthy board on a throttled probe in late December.
+    # season_types=None because UFC events do not carry the 1/2/3 US season convention.
+    # reporter=chk registers the guard, which is what require("freshness") verifies ran.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
 
     up, _feed_ok = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
@@ -325,7 +327,9 @@ def run(today_str):
                 # "goes the distance" or "ends inside"; the winner line never does.
                 dist_lines = [ln for ln in combo
                               if "goes the distance" in ln or "ends inside" in ln]
-                combo = ["too close to call"] + dist_lines
+                # Leading indent so notify renders it as subtext, not a plain-text line that
+                # reads like a header.
+                combo = ["  too close to call"] + dist_lines
             for ln in combo:
                 print("  " + ln)
             rows.append({"date": r.date, "game": f"{r.A} vs {r.B}",
@@ -424,7 +428,7 @@ def run(today_str):
     log["result"], log["went_dist"] = g[0], g[1]
     # Anything past its date and still ungraded. Silence here used to mean the bout simply
     # never appeared in the rolling metrics, with nothing to say why.
-    _cut = (pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=2))
+    _cut = (pd.Timestamp.now("UTC").tz_localize(None) - pd.Timedelta(days=2))
     _stale = log[log.result.isna() & (pd.to_datetime(log.date, errors="coerce") < _cut)]
     if len(_stale):
         print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
@@ -501,7 +505,10 @@ def run(today_str):
             if not combo:
                 skipped += 1
                 continue
-            block = [f"{r['date']} {r['game']}"] + combo
+            # TWO spaces after the date: notify.HEADER is ^(date)\s{2,}(.+)$, so a single
+            # space falls through to plain text and the fight titles lose their bold and the
+            # blank-line separation, flattening the whole post.
+            block = [f"{r['date']}  {r['game']}"] + combo
             push[r["fight_id"]] = {"line": "\n".join(block),
                                    # A too-close fight has no ML price; pin its gate value so
                                    # a p_win_a drifting inside the band does not emit a
