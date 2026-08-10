@@ -1,17 +1,14 @@
 """
 MBM MMA daily runner (rebuild v1, frozen spec).
-
 - Refreshes finished bouts from Wikipedia event pages (results, method, round, time)
 - Pulls upcoming UFC cards from ESPN, the only source that lists fights before they happen
 - Boards three markets: moneyline, goes-the-distance, and winner by method
 - Grades logged forecasts, prints rolling metrics, last-200 tripwire
 - Discord push routed through tg_delta so refreshes only report what moved
-
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
 import argparse, difflib, json, math, os, re, sys, time, datetime as dt
 from collections import defaultdict
-
 import numpy as np, pandas as pd, requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,7 +28,7 @@ import mbm_checks as CHK
 # freshness.py and mbm_checks.py are in the guard because this runner now wires the
 # freshness guard and the check harness; the FR.guard(reporter=) call needs the
 # 2026-08-09 freshness at runtime.
-SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
+SHARED_MIN = "2026-08-02" # mma_board two-row form; this runner does not call line()
 for _mod in (BF, notify, tg_delta, FR, CHK):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
@@ -41,30 +38,54 @@ for _mod in (BF, notify, tg_delta, FR, CHK):
 
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
-WH = {"User-Agent": "MBM-forecasting/1.0 (contact: maparsons4@gmail.com)"}
-EH = {}          # ESPN 403s any custom User-Agent; only the default requests UA works
+WH = {"User-Agent": "MBM-forecasting/1.0 (contact: maparsons4@gmail.com)"}  # Wikipedia wants a UA
+# ESPN 403s ANY custom User-Agent and only serves the requests default. Measured live
+# 2026-08-10: this exact scoreboard URL with no headers returns 200, with "Mozilla/5.0"
+# returns 403. The board sent a UA and every slate fetch failed silently (403 -> empty ->
+# read as "no fights"), which no_silent_empty finally surfaced. Same reason nba/ncaaf carry
+# ESPN_H = {}. Do NOT "fix" this by adding a UA.
+EH = {}
 FIGHTS = os.path.join(HERE, "data", "fights_clean.csv")
 ATTRS = os.path.join(HERE, "data", "attrs.csv")
 LOGS = os.path.join(HERE, "logs")
 SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_THROUGH = SPEC["train_through"]
-
 # Cards are announced weeks out but only firm up in the last few days, and everything
 # beyond the imminent card is noise on a board pushed daily. Five days covers Friday
 # evening through the following Wednesday from any run.
 HORIZON_DAYS = 5
-
 # How near a result must sit to a logged fight's date to be its result. Rematches of the
 # same pair are months apart, so this cleanly separates them; a fight and its own result
 # share a date to within a day.
 REMATCH_TOL_DAYS = 45
-
+# Input-adequacy floor, NOT a probability band. A market priced at a coin flip means two
+# opposite things: a genuine 50/50 between established fighters (a real forecast, worth
+# publishing) or "no data" for debutants (the prior returned unchanged). The probability
+# alone cannot tell them apart, so withhold on the INPUT: a fight where either fighter's
+# recorded bout count is below this is not boarded. min(n_a, n_b) < 3 removes a Contender
+# Series card of debutants while keeping every fight with a real record, including the true
+# coin flips. Same shape as the engines' shrink, applied where the thinness is still
+# measurable. Withheld fights are still forecast, logged and graded (only held from Discord).
+ADEQ_MIN_BOUTS = 3
+# Closeness band: a DISPLAY rule, not suppression, and MMA-specific. On a genuine even fight
+# between two fighters with real records the model's separation is within noise, and the side
+# named is only ESPN's competitor order (f1 = names[0]), so "A 50.3%" is a coin toss reported
+# as a lean. Within this band the winner market renders "too close to call" -- no side, no
+# price; the order-independent distance market still shows, and p_win_a is still logged and
+# graded (the closeness decision itself is logged too, so the dashboard can report how often
+# the model declines to pick). Does NOT port to WNBA/soccer, where A/home is a real side.
+#
+# 0.05 is a CURRENT ESTIMATE from the graded record, not a settled constant: below 0.55 no
+# cut's hit rate is distinguishable from a coin flip (0.52-0.54 came in at 48.1% while
+# 0.50-0.52 hit 57.4% -- the non-monotonicity is the tell), and everything from 0.60 up
+# behaves (66.7% vs 64.4% expected). n is only ~100 below 0.55 and thin. Re-measure after
+# another season.
+CLOSE_BAND = 0.05
 # Tracks board_format rather than restating it. This is the console-side copy, and a
 # local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
 # quoted different prices for the same game.
 MIN_EDGE = BF.MIN_EDGE
-
 
 def preflight():
     """Fail loudly and usefully if a committed data file is missing. The import guard in
@@ -82,11 +103,9 @@ def preflight():
         print(f"\nrepo root currently contains: {sorted(os.listdir(HERE))}")
         sys.exit(1)
 
-
 def min_odds(p):
     p = min(max(float(p), 0.01), 0.99)
     return math.ceil((1 + MIN_EDGE) / p * 100) / 100.0
-
 
 # ------------------------------------------------------------------ refresh
 def refresh_results(days_back=75):
@@ -152,7 +171,6 @@ def refresh_results(days_back=75):
     print(f"results refreshed: +{len(N)} bouts from {len(recent)} recent events")
     return F
 
-
 def _method(s):
     t = str(s).lower()
     for k, v in (("no contest", "NC"), ("draw", "Draw"), ("technical submission", "SUB"),
@@ -160,7 +178,6 @@ def _method(s):
         if k in t:
             return v
     return "KO" if t.startswith("ko") else "OTHER"
-
 
 def fetch_upcoming(today):
     """ESPN is the only feed that lists fights before they happen.
@@ -199,7 +216,6 @@ def fetch_upcoming(today):
                          "sched": c.get("format", {}).get("regulation", {}).get("periods", 3)})
     return pd.DataFrame(rows), True
 
-
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
     chk = CHK.Reporter("MMA", today.strftime("%Y%m%d"))
@@ -210,13 +226,11 @@ def run(today_str):
     # Freshness. MMA never wired this before: freshness.py sat in the repo unused, so the
     # board priced fights with no check that the Wikipedia results history was current.
     # ESPN's mma/ufc scoreboard lists completed cards, so probe it against the newest bout
-    # the history holds. grace 40: cards are weekly (median gap 6d) but the holiday break
-    # after 2025-12-20 ran 35 days, and blocking a healthy board because the probe was
-    # throttled during a legitimate gap is a real cost. season_types=None because the
-    # field is present but not meaningful for MMA. reporter=chk registers the guard, which is
+    # the history holds. Weekly cards -> grace 7. season_types=None because UFC events do
+    # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
     # what require("freshness") verifies actually ran.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
 
     up, _feed_ok = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
@@ -250,7 +264,9 @@ def run(today_str):
     log = pd.read_csv(pred_path, dtype={"fight_id": str}) if os.path.exists(pred_path) else \
         pd.DataFrame(columns=["date", "fight_id", "event", "A", "B", "p_win_a", "p_elo",
                               "p_distance", "p_a_ko", "p_a_sub", "p_a_dec",
-                              "p_b_ko", "p_b_sub", "p_b_dec", "model"])
+                              "p_b_ko", "p_b_sub", "p_b_dec", "model", "close"])
+    if "close" not in log.columns:
+        log["close"] = pd.NA   # rows logged before the closeness rule existed
 
     # Pregame guard. fetch_upcoming already filters to state=="pre"; this confirms the
     # filter held, and (the arm the filter cannot cover) refuses to re-board a fight the
@@ -265,6 +281,10 @@ def run(today_str):
     if len(board):
         pr = E.predict(heads, board)
         b = board[["fight_id", "event", "wt", "sched"]].copy()
+        # Recorded bout counts, carried for the input-adequacy floor below. engine_mma holds
+        # them as win-head features, capped at 20.
+        b["n_a"] = board.n_a.values
+        b["n_b"] = board.n_b.values
         # Title-cased for the board and the dashboard; grading re-normalises, so either
         # casing joins correctly.
         b["A"] = board.A.str.title().values
@@ -275,21 +295,43 @@ def run(today_str):
         b["date"] = board.date.dt.strftime("%Y-%m-%d")
         for c in pr.columns:
             b[c] = pr[c].values
+        # Closeness is decided on p_win_a and logged, so the dashboard can later report how
+        # often the model declines to name a side.
+        b["close"] = (b["p_win_a"] - 0.5).abs() < CLOSE_BAND
         # Tag from the spec, not a literal, so bumping the head without updating the spec
         # trips model_identity below.
         b["model"] = SPEC.get("model", "v1")
         for _, r in b.sort_values(["date", "event"]).iterrows():
             fav, pf = (r.A, r.p_win_a) if r.p_win_a >= .5 else (r.B, 1-r.p_win_a)
+            n_min = int(min(r.n_a, r.n_b))
+            # Closeness only applies to fights that clear the adequacy floor; a no-data fight
+            # is withheld entirely, not shown as "too close to call".
+            close_display = bool(r.close) and n_min >= ADEQ_MIN_BOUTS
+            thin_note = (f"   [WITHHELD: thin record, min {n_min} bout(s) < {ADEQ_MIN_BOUTS}]"
+                         if n_min < ADEQ_MIN_BOUTS else "")
             print(f"{r.date}  {r.A} vs {r.B}  ({r.wt}, {int(r.sched)}r)")
-            print(f"  ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}")
+            if close_display:
+                print(f"  ML   too close to call (p_win_a {r.p_win_a:.3f}, within "
+                      f"{CLOSE_BAND:.2f} of 0.50)")
+            else:
+                print(f"  ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}{thin_note}")
             print(f"  DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
                   f"  | inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
             combo = BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
                                  r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B)
+            if close_display:
+                # Replace the winner market with a no-side "too close to call", keep the
+                # order-independent distance market. The distance line is the one naming
+                # "goes the distance" or "ends inside"; the winner line never does.
+                dist_lines = [ln for ln in combo
+                              if "goes the distance" in ln or "ends inside" in ln]
+                combo = ["too close to call"] + dist_lines
             for ln in combo:
                 print("  " + ln)
-            rows.append({"date": r.date, "game": f"{r.A} vs {r.B}", "pick": fav,
-                         "p": pf, "fight_id": r.fight_id, "combo": combo})
+            rows.append({"date": r.date, "game": f"{r.A} vs {r.B}",
+                         "pick": ("too close to call" if close_display else fav),
+                         "p": pf, "fight_id": r.fight_id, "combo": combo,
+                         "n_min": n_min, "close": bool(r.close)})
         keep = [c for c in log.columns if c in b.columns]
         log = pd.concat([log[~log.fight_id.isin(b.fight_id)], b[keep]], ignore_index=True)
     else:
@@ -382,13 +424,13 @@ def run(today_str):
     log["result"], log["went_dist"] = g[0], g[1]
     # Anything past its date and still ungraded. Silence here used to mean the bout simply
     # never appeared in the rolling metrics, with nothing to say why.
-    _cut = (pd.Timestamp.now('UTC').tz_localize(None) - pd.Timedelta(days=2))
+    _cut = (pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=2))
     _stale = log[log.result.isna() & (pd.to_datetime(log.date, errors="coerce") < _cut)]
     if len(_stale):
         print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
               f"result:")
         for _, _r in _stale.sort_values("date").tail(8).iterrows():
-            print(f"  {_r.date}  {_r.A} vs {_r.B}")
+            print(f"  {_r.date} {_r.A} vs {_r.B}")
 
     # ---- invariant checks, before anything is persisted or published ----
     if len(board):
@@ -396,17 +438,19 @@ def run(today_str):
     chk.column_contract("result", log.result, "binary")
     chk.column_contract("went_dist", log.went_dist, "binary")
     chk.column_contract("p_win_a", log.p_win_a, "prob")
-    chk.model_identity(log.model.dropna().unique(),
-                       SPEC.get("model_tags", [SPEC.get("model", "v1")]))
+    chk.model_identity(log.model.dropna().unique(), SPEC.get("model", "v1"))
     if rows:
         chk.log_board_agreement(pushed_ids=[r["fight_id"] for r in rows],
                                 logged_ids_today=log.fight_id)
+    # Conviction backstop, on the fights that clear the adequacy floor. With the bout-count
+    # rule in place, an identical-probability cluster here means a prior slipped through in
+    # a way the adequacy rule did not anticipate -- exactly when you want to hear about it.
+    chk.no_conviction([r["p"] for r in rows if r["n_min"] >= ADEQ_MIN_BOUTS])
     # Gate the write AND the push: a failed invariant aborts here, before the log is
     # persisted (duplicate/misgraded rows) and before Discord.
     chk.finish(strict=True, require=["freshness"])
 
     log.to_csv(pred_path, index=False)
-
     dec = log[log.result.isin([0.0, 1.0])]
     if len(dec) >= 30:
         y = dec.result.astype(int).values
@@ -414,28 +458,35 @@ def run(today_str):
         print(f"\nrolling grade (n={len(y)}):")
         pc = np.clip(dec.p_win_a.values.astype(float), 1e-6, 1-1e-6)
         from sklearn.metrics import log_loss
-        print(f"  moneyline: LL={log_loss(y, pc):.4f}  base={log_loss(y, np.full(len(y), base)):.4f}  "
+        print(f"  moneyline: LL={log_loss(y, pc):.4f} base={log_loss(y, np.full(len(y), base)):.4f} "
               f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
         dd = dec[dec.went_dist.notna()]
         if len(dd) >= 30:
             yd = dd.went_dist.astype(int).values
             pd_ = np.clip(dd.p_distance.values.astype(float), 1e-6, 1-1e-6)
-            print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
+            print(f"  distance : LL={log_loss(yd, pd_):.4f} base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
         w = dec.tail(200)
         if len(w) >= 200:
             yy = w.result.astype(int).values
             edge = log_loss(yy, np.full(len(yy), base)) - \
                 log_loss(yy, np.clip(w.p_win_a.values.astype(float), 1e-6, 1-1e-6))
-            print(f"  last-200 edge vs base: {edge:+.4f}  "
+            print(f"  last-200 edge vs base: {edge:+.4f} "
                   f"[{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
             if edge <= 0:
                 alerts.append("MMA moneyline")
         dec.to_csv(os.path.join(LOGS, "graded.csv"), index=False)
 
-    push, skipped = {}, 0
+    push, skipped, thin = {}, 0, 0
     if rows:
         for r in rows:
+            # Input-adequacy floor: withhold a fight where either fighter's record is too
+            # thin for the model to be doing more than returning its prior. A genuine coin
+            # flip between two established fighters is a real forecast and still publishes.
+            # Still forecast, logged and graded above -- this only holds it from Discord.
+            if r["n_min"] < ADEQ_MIN_BOUTS:
+                thin += 1
+                continue
             if BF.min_odds(r["p"]) < BF.PRICE_FLOOR:
                 skipped += 1
                 continue
@@ -445,9 +496,13 @@ def run(today_str):
             if not combo:
                 skipped += 1
                 continue
-            block = [f"{r['date']}  {r['game']}"] + combo
+            block = [f"{r['date']} {r['game']}"] + combo
             push[r["fight_id"]] = {"line": "\n".join(block),
-                                   "min_odds": BF.min_odds(r["p"]),
+                                   # A too-close fight has no ML price; pin its gate value so
+                                   # a p_win_a drifting inside the band does not emit a
+                                   # phantom "price moved" note. Only a status change (into or
+                                   # out of the band), carried by the match field, is news.
+                                   "min_odds": (2.0 if r.get("close") else BF.min_odds(r["p"])),
                                    # Carries BOTH the matchup and the side. The matchup
                                    # alone catches a replaced opponent under the same ESPN
                                    # id but is blind to the model changing its mind: on a
@@ -460,16 +515,25 @@ def run(today_str):
         print("\n=== MBM MMA board ===")
         for _v in push.values():
             print(_v["line"])
-        if skipped:
-            print(f"({skipped} fight{'s' if skipped != 1 else ''} skipped, "
-                  f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})")
+        if skipped or thin:
+            _bits = []
+            if thin:
+                _bits.append(f"{thin} withheld on thin record (<{ADEQ_MIN_BOUTS} bouts)")
+            if skipped:
+                _bits.append(f"{skipped} below price floor "
+                             f"{BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")
+            print("(" + "; ".join(_bits) + ")")
 
     mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
     if lines or alerts:
         body = list(lines) if lines else ["no price changes since the last push"]
-        foot = (f"{skipped} fight{'s' if skipped != 1 else ''} skipped, "
-                f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
-            if skipped else None
+        _foot_bits = []
+        if thin:
+            _foot_bits.append(f"{thin} withheld (thin record)")
+        if skipped:
+            _foot_bits.append(f"{skipped} below price floor "
+                              f"{BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")
+        foot = " · ".join(_foot_bits) if _foot_bits else None
         title = "MBM MMA" + (" · changes since the last push"
                              if mode == "delta" and lines else "")
         colour = notify.GREEN
@@ -482,7 +546,6 @@ def run(today_str):
         print("no board to send")
     else:
         print("board unchanged since the last push, nothing sent")
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
