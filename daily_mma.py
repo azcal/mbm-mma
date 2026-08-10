@@ -8,6 +8,7 @@ MBM MMA daily runner (rebuild v1, frozen spec).
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
 import argparse, difflib, json, math, os, re, sys, time, datetime as dt
+from collections import defaultdict
 import numpy as np, pandas as pd, requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,14 +17,19 @@ import engine_mma as E
 import tg_delta
 import board_format as BF
 import notify
+import freshness as FR
+import mbm_checks as CHK
 
 # A stale copy of a shared file shows up as a wrong-looking board or an AttributeError
 # halfway through a run. This turns it into a named failure in the workflow's import
 # guard, which takes seconds. A minimum rather than an exact match, so a later
 # improvement to a shared file does not force an edit here; raise it only for a change
 # this runner depends on.
-SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
-for _mod in (BF, notify, tg_delta):
+# freshness.py and mbm_checks.py are in the guard because this runner now wires the
+# freshness guard and the check harness; the FR.guard(reporter=) call needs the
+# 2026-08-09 freshness at runtime.
+SHARED_MIN = "2026-08-02" # mma_board two-row form; this runner does not call line()
+for _mod in (BF, notify, tg_delta, FR, CHK):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
         raise ImportError(
@@ -44,11 +50,14 @@ TRAIN_THROUGH = SPEC["train_through"]
 # beyond the imminent card is noise on a board pushed daily. Five days covers Friday
 # evening through the following Wednesday from any run.
 HORIZON_DAYS = 5
+# How near a result must sit to a logged fight's date to be its result. Rematches of the
+# same pair are months apart, so this cleanly separates them; a fight and its own result
+# share a date to within a day.
+REMATCH_TOL_DAYS = 45
 # Tracks board_format rather than restating it. This is the console-side copy, and a
 # local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
 # quoted different prices for the same game.
 MIN_EDGE = BF.MIN_EDGE
-
 
 def preflight():
     """Fail loudly and usefully if a committed data file is missing. The import guard in
@@ -66,11 +75,9 @@ def preflight():
         print(f"\nrepo root currently contains: {sorted(os.listdir(HERE))}")
         sys.exit(1)
 
-
 def min_odds(p):
     p = min(max(float(p), 0.01), 0.99)
     return math.ceil((1 + MIN_EDGE) / p * 100) / 100.0
-
 
 # ------------------------------------------------------------------ refresh
 def refresh_results(days_back=75):
@@ -136,7 +143,6 @@ def refresh_results(days_back=75):
     print(f"results refreshed: +{len(N)} bouts from {len(recent)} recent events")
     return F
 
-
 def _method(s):
     t = str(s).lower()
     for k, v in (("no contest", "NC"), ("draw", "Draw"), ("technical submission", "SUB"),
@@ -144,7 +150,6 @@ def _method(s):
         if k in t:
             return v
     return "KO" if t.startswith("ko") else "OTHER"
-
 
 def fetch_upcoming(today):
     """ESPN is the only feed that lists fights before they happen."""
@@ -160,7 +165,8 @@ def fetch_upcoming(today):
         for c in ev.get("competitions", []):
             cs = c.get("competitors", [])
             # "pre" only. completed=False is also true of a bout currently being fought.
-            if len(cs) != 2 or c.get("status", {}).get("type", {}).get("state") != "pre":
+            state = (c.get("status", {}).get("type", {}) or {}).get("state")
+            if len(cs) != 2 or state != "pre":
                 continue
             names = [x.get("athlete", {}).get("displayName") for x in cs]
             if not all(names):
@@ -169,15 +175,27 @@ def fetch_upcoming(today):
                          "date": pd.Timestamp(ev.get("date")).tz_localize(None).normalize(),
                          "weight": c.get("type", {}).get("abbreviation", ""),
                          "f1": names[0], "f2": names[1],
+                         # carried so pregame_only can confirm the filter held
+                         "state": state,
                          "sched": c.get("format", {}).get("regulation", {}).get("periods", 3)})
     return pd.DataFrame(rows)
 
-
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
+    chk = CHK.Reporter("MMA", today.strftime("%Y%m%d"))
     preflight()
     F = refresh_results()
     A = E.load_attrs(ATTRS)
+
+    # Freshness. MMA never wired this before: freshness.py sat in the repo unused, so the
+    # board priced fights with no check that the Wikipedia results history was current.
+    # ESPN's mma/ufc scoreboard lists completed cards, so probe it against the newest bout
+    # the history holds. Weekly cards -> grace 7. season_types=None because UFC events do
+    # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
+    # what require("freshness") verifies actually ran.
+    _newest = pd.to_datetime(F.date).max().date() if len(F) else None
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
+
     up = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
 
@@ -207,6 +225,15 @@ def run(today_str):
                               "p_distance", "p_a_ko", "p_a_sub", "p_a_dec",
                               "p_b_ko", "p_b_sub", "p_b_dec", "model"])
 
+    # Pregame guard. fetch_upcoming already filters to state=="pre"; this confirms the
+    # filter held, and (the arm the filter cannot cover) refuses to re-board a fight the
+    # log has already graded. MMA history carries no ESPN id, so the history arm keys on
+    # the graded log's fight_ids rather than the results store.
+    _graded_ids = (set(log.loc[log.result.notna(), "fight_id"].astype(str))
+                   if "result" in log.columns else set())
+    chk.pregame_only(up.to_dict("records") if len(up) else [],
+                     history_ids=_graded_ids, id_key="fight_id")
+
     board = Dall[Dall.pending].copy()
     if len(board):
         pr = E.predict(heads, board)
@@ -221,13 +248,15 @@ def run(today_str):
         b["date"] = board.date.dt.strftime("%Y-%m-%d")
         for c in pr.columns:
             b[c] = pr[c].values
-        b["model"] = "v1"
+        # Tag from the spec, not a literal, so bumping the head without updating the spec
+        # trips model_identity below.
+        b["model"] = SPEC.get("model", "v1")
         for _, r in b.sort_values(["date", "event"]).iterrows():
             fav, pf = (r.A, r.p_win_a) if r.p_win_a >= .5 else (r.B, 1-r.p_win_a)
-            print(f"{r.date} {r.A} vs {r.B} ({r.wt}, {int(r.sched)}r)")
-            print(f"    ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}")
-            print(f"    DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
-                  f"   |   inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
+            print(f"{r.date}  {r.A} vs {r.B}  ({r.wt}, {int(r.sched)}r)")
+            print(f"  ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}")
+            print(f"  DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
+                  f"  | inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
             combo = BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
                                  r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B)
             for ln in combo:
@@ -240,24 +269,37 @@ def run(today_str):
         print("no upcoming fights in horizon")
 
     # ---- grade ----
-    res = F.assign(k=F.f1.map(E.norm_name) + "|" + F.f2.map(E.norm_name))
-    # Keyed on the sorted pair so either fighter order finds the bout, but the value
-    # stored is the WINNER'S name rather than a flag. The previous version stored
-    # "1.0 if the winner sorts first", and `result` is paired with p_win_a, which is
-    # P(row.A wins). Those only agree while row.A is always the alphabetically first
-    # name. It is, in all 329 logged rows, so nothing has been graded wrongly yet, but
-    # the day an upstream feed lists a bout the other way round, half the grades invert
-    # silently and the board reads 50% forever.
-    # Exact key first: the sorted normalised pair. The value stored is the WINNER'S name
-    # rather than a flag, because `result` is paired with p_win_a, which is P(row.A wins),
-    # and a "did the first-sorting name win" flag only agrees with that while row.A
-    # happens to sort first.
-    won, keys = {}, []
-    for r in res.itertuples():
+    # Keyed on the sorted normalised pair, but as a LIST per pair with each result's date,
+    # not a single overwrite. A pair that fought more than once (a rematch) shares one key,
+    # and storing only the last result graded the earlier fight against the later winner:
+    # measured at 7.1% of the history being repeat pairings, ~1 in 5 with a different
+    # winner the second time, so the earlier leg silently graded wrong. Resolving by
+    # nearest date within tolerance picks the right bout; a pair that appears once has no
+    # ambiguity and resolves directly. The value stored is the WINNER'S name rather than a
+    # flag, because `result` is paired with p_win_a = P(row.A wins), and a "did the
+    # first-sorting name win" flag only agrees while row.A happens to sort first.
+    won, keys = defaultdict(list), []
+    for r in F.itertuples():
         a, bb = sorted([E.norm_name(r.f1), E.norm_name(r.f2)])
         k = f"{a}|{bb}"
-        won[k] = (E.norm_name(r.f1), bool(r.distance))
+        won[k].append((pd.to_datetime(r.date), E.norm_name(r.f1), bool(r.distance)))
         keys.append(k)
+
+    def _resolve(k, row_date):
+        """Winner and distance for pair-key `k` nearest the logged fight's date.
+
+        One result on the key: unambiguous, return it. Several (a rematch): the nearest
+        within REMATCH_TOL_DAYS, else None rather than a guess."""
+        lst = won.get(k)
+        if not lst:
+            return None
+        if len(lst) == 1:
+            return lst[0][1], lst[0][2]
+        rd = pd.to_datetime(row_date)
+        d0, winner, dist = min(lst, key=lambda x: abs((x[0] - rd).days))
+        if abs((d0 - rd).days) <= REMATCH_TOL_DAYS:
+            return winner, dist
+        return None
 
     def close_key(k):
         """Nearest result key, for a bout whose names differ between the two sources.
@@ -285,12 +327,14 @@ def run(today_str):
     def grade(row):
         a, bb = sorted([E.norm_name(row.A), E.norm_name(row.B)])
         k = f"{a}|{bb}"
-        hit = won.get(k)
+        hit = _resolve(k, row.date)
         if hit is None:
             alt = close_key(k)
             if alt is None:
                 return (np.nan, np.nan)
-            hit = won[alt]
+            hit = _resolve(alt, row.date)
+            if hit is None:
+                return (np.nan, np.nan)
             fuzzy.append(f"{row.A} vs {row.B} -> {alt.replace('|', ' vs ')}")
         winner, dist = hit
         # Compare the winner to row.A directly rather than to whichever name sorts first.
@@ -307,7 +351,7 @@ def run(today_str):
     if fuzzy:
         print(f"graded {len(fuzzy)} bout(s) by nearest name match, check these look right:")
         for f in fuzzy[:6]:
-            print(f"   {f}")
+            print(f"  {f}")
     log["result"], log["went_dist"] = g[0], g[1]
     # Anything past its date and still ungraded. Silence here used to mean the bout simply
     # never appeared in the rolling metrics, with nothing to say why.
@@ -317,7 +361,22 @@ def run(today_str):
         print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
               f"result:")
         for _, _r in _stale.sort_values("date").tail(8).iterrows():
-            print(f"   {_r.date}  {_r.A} vs {_r.B}")
+            print(f"  {_r.date} {_r.A} vs {_r.B}")
+
+    # ---- invariant checks, before anything is persisted or published ----
+    if len(board):
+        chk.key_join("fight_id", log.fight_id, b.fight_id)
+    chk.column_contract("result", log.result, "binary")
+    chk.column_contract("went_dist", log.went_dist, "binary")
+    chk.column_contract("p_win_a", log.p_win_a, "prob")
+    chk.model_identity(log.model.dropna().unique(), SPEC.get("model", "v1"))
+    if rows:
+        chk.log_board_agreement(pushed_ids=[r["fight_id"] for r in rows],
+                                logged_ids_today=log.fight_id)
+    # Gate the write AND the push: a failed invariant aborts here, before the log is
+    # persisted (duplicate/misgraded rows) and before Discord.
+    chk.finish(strict=True, require=["freshness"])
+
     log.to_csv(pred_path, index=False)
     dec = log[log.result.isin([0.0, 1.0])]
     if len(dec) >= 30:
@@ -326,20 +385,20 @@ def run(today_str):
         print(f"\nrolling grade (n={len(y)}):")
         pc = np.clip(dec.p_win_a.values.astype(float), 1e-6, 1-1e-6)
         from sklearn.metrics import log_loss
-        print(f"  moneyline: LL={log_loss(y, pc):.4f}  base={log_loss(y, np.full(len(y), base)):.4f}  "
+        print(f"  moneyline: LL={log_loss(y, pc):.4f} base={log_loss(y, np.full(len(y), base)):.4f} "
               f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
         dd = dec[dec.went_dist.notna()]
         if len(dd) >= 30:
             yd = dd.went_dist.astype(int).values
             pd_ = np.clip(dd.p_distance.values.astype(float), 1e-6, 1-1e-6)
-            print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
+            print(f"  distance : LL={log_loss(yd, pd_):.4f} base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
         w = dec.tail(200)
         if len(w) >= 200:
             yy = w.result.astype(int).values
             edge = log_loss(yy, np.full(len(yy), base)) - \
                 log_loss(yy, np.clip(w.p_win_a.values.astype(float), 1e-6, 1-1e-6))
-            print(f"  last-200 edge vs base: {edge:+.4f}  "
+            print(f"  last-200 edge vs base: {edge:+.4f} "
                   f"[{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
             if edge <= 0:
                 alerts.append("MMA moneyline")
@@ -357,7 +416,7 @@ def run(today_str):
             if not combo:
                 skipped += 1
                 continue
-            block = [f"{r['date']}  {r['game']}"] + combo
+            block = [f"{r['date']} {r['game']}"] + combo
             push[r["fight_id"]] = {"line": "\n".join(block),
                                    "min_odds": BF.min_odds(r["p"]),
                                    # Carries BOTH the matchup and the side. The matchup
@@ -369,19 +428,19 @@ def run(today_str):
                                    # new one. That is how a published pick and a graded
                                    # pick came apart on 2026-08-04.
                                    "match": f"{r['pick']} in {r['game']}"}
-    print("\n=== MBM MMA board ===")
-    for _v in push.values():
-        print(_v["line"])
-    if skipped:
-        print(f"({skipped} fight{'s' if skipped != 1 else ''} skipped, "
-              f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})")
+        print("\n=== MBM MMA board ===")
+        for _v in push.values():
+            print(_v["line"])
+        if skipped:
+            print(f"({skipped} fight{'s' if skipped != 1 else ''} skipped, "
+                  f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)})")
 
     mode, lines = tg_delta.gate(LOGS, today.strftime("%Y%m%d"), push)
     if lines or alerts:
         body = list(lines) if lines else ["no price changes since the last push"]
         foot = (f"{skipped} fight{'s' if skipped != 1 else ''} skipped, "
                 f"price floor {BF.PRICE_FLOOR:.2f} / {BF.american(BF.PRICE_FLOOR)}")\
-               if skipped else None
+            if skipped else None
         title = "MBM MMA" + (" · changes since the last push"
                              if mode == "delta" and lines else "")
         colour = notify.GREEN
