@@ -235,6 +235,33 @@ class Reporter:
             return self._emit("WARN", f"{check}:{name}", "empty, upstream reported ok (nothing to do)")
         return self._emit("PASS", f"{check}:{name}", "non-empty")
 
+    def no_conviction(self, probs, min_repeat=3, decimals=4, check="no_conviction"):
+        """Flag a board where several markets share an identical probability -- the
+        fingerprint of a model returning its PRIOR for thin data rather than a forecast.
+
+        Five fights boarded at exactly 0.503 is not five close fights, it is one prior
+        printed five times and published as a 1.99 pick. WARN, not FAIL: it is a heuristic
+        on the boarded numbers, and the hard rule is the conviction floor in board_format
+        (which suppresses near-0.5 markets from Discord). This is the belt-and-braces that
+        catches a prior leaking through, and it is what made the 0.503 cluster visible at
+        all -- without it they read as five separate close calls.
+        """
+        from collections import Counter
+        vals = [round(float(p), decimals) for p in probs
+                if p is not None and str(p) != "nan"]
+        if not vals:
+            return self._emit("PASS", check, "no probabilities to check")
+        repeats = {v: n for v, n in Counter(vals).items() if n >= min_repeat}
+        if repeats:
+            worst_v, worst_n = max(repeats.items(), key=lambda kv: kv[1])
+            extra = f"; {len(repeats) - 1} other repeated value(s)" if len(repeats) > 1 else ""
+            return self._emit("WARN", check,
+                              f"{worst_n} boarded market(s) share probability {worst_v} -- "
+                              f"the fingerprint of a prior returned for thin data, not a "
+                              f"forecast{extra}")
+        return self._emit("PASS", check,
+                          f"{len(vals)} market(s), no probability repeated {min_repeat}+ times")
+
     def assert_sorted(self, name, seq, key=None, check="determinism"):
         """A sequence a downstream step depends on must have a stated order.
 

@@ -438,7 +438,12 @@ def run(today_str):
     chk.column_contract("result", log.result, "binary")
     chk.column_contract("went_dist", log.went_dist, "binary")
     chk.column_contract("p_win_a", log.p_win_a, "prob")
-    chk.model_identity(log.model.dropna().unique(), SPEC.get("model", "v1"))
+    # Two keys, two jobs: the board WRITES the single current head (SPEC["model"], a scalar
+    # so it broadcasts to every new row); the check compares the log's tags against the
+    # ACCEPTED SET (SPEC["model_tags"], e.g. ["v1", "v1-backfill"]). Using one key for both
+    # is what caused the length-2-vs-17 write error and the false FAIL on v1-backfill.
+    chk.model_identity(log.model.dropna().unique(),
+                       SPEC.get("model_tags", [SPEC.get("model", "v1")]))
     if rows:
         chk.log_board_agreement(pushed_ids=[r["fight_id"] for r in rows],
                                 logged_ids_today=log.fight_id)
