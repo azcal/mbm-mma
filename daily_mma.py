@@ -159,7 +159,8 @@ def fetch_upcoming(today):
     for ev in r.get("events", []):
         for c in ev.get("competitions", []):
             cs = c.get("competitors", [])
-            if len(cs) != 2 or c.get("status", {}).get("type", {}).get("completed"):
+            # "pre" only. completed=False is also true of a bout currently being fought.
+            if len(cs) != 2 or c.get("status", {}).get("type", {}).get("state") != "pre":
                 continue
             names = [x.get("athlete", {}).get("displayName") for x in cs]
             if not all(names):
