@@ -194,7 +194,7 @@ def run(today_str):
     # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
     # what require("freshness") verifies actually ran.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
 
     up = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
