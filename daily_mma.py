@@ -152,14 +152,22 @@ def _method(s):
     return "KO" if t.startswith("ko") else "OTHER"
 
 def fetch_upcoming(today):
-    """ESPN is the only feed that lists fights before they happen."""
+    """ESPN is the only feed that lists fights before they happen.
+
+    Returns (frame, feed_ok). feed_ok is False when the pull failed, so the caller can tell
+    an ESPN outage (empty because we could not ask) from a genuinely empty card. Without it,
+    "ESPN feed unavailable" followed by "0 fights" is indistinguishable from a quiet week --
+    incident 3, the swallowed-error empty.
+    """
     lo = today.strftime("%Y%m%d")
     hi = (today + dt.timedelta(days=HORIZON_DAYS)).strftime("%Y%m%d")
     try:
-        r = requests.get(ESPN, headers=EH, params={"dates": f"{lo}-{hi}"}, timeout=60).json()
+        resp = requests.get(ESPN, headers=EH, params={"dates": f"{lo}-{hi}"}, timeout=60)
+        resp.raise_for_status()
+        r = resp.json()
     except Exception as ex:
         print("ESPN feed unavailable:", type(ex).__name__)
-        return pd.DataFrame()
+        return pd.DataFrame(), False
     rows = []
     for ev in r.get("events", []):
         for c in ev.get("competitions", []):
@@ -178,7 +186,7 @@ def fetch_upcoming(today):
                          # carried so pregame_only can confirm the filter held
                          "state": state,
                          "sched": c.get("format", {}).get("regulation", {}).get("periods", 3)})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), True
 
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
@@ -194,10 +202,15 @@ def run(today_str):
     # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
     # what require("freshness") verifies actually ran.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
 
-    up = fetch_upcoming(today)
+    up, _feed_ok = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
+    # Incident 3 live: a failed ESPN pull returns empty, which reads exactly like a quiet
+    # week. WARN, not FAIL -- a slate outage means no board this run, but must not kill the
+    # independent Wikipedia-based grading below.
+    chk.no_silent_empty("espn_slate", is_empty=(len(up) == 0), call_failed=not _feed_ok,
+                        warn_only=True)
 
     pseudo = []
     if len(up):
