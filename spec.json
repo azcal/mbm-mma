@@ -7,6 +7,6 @@
  },
  "C": 0.05,
  "train_through": 2025,
- "model": "v1",
+ "model": ["v1", "v1-backfill"],
  "note": "tuned on 2018-2025 walk-forward; 2026 opened once"
 }
