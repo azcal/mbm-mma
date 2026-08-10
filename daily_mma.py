@@ -1,14 +1,17 @@
 """
 MBM MMA daily runner (rebuild v1, frozen spec).
+
 - Refreshes finished bouts from Wikipedia event pages (results, method, round, time)
 - Pulls upcoming UFC cards from ESPN, the only source that lists fights before they happen
 - Boards three markets: moneyline, goes-the-distance, and winner by method
 - Grades logged forecasts, prints rolling metrics, last-200 tripwire
 - Discord push routed through tg_delta so refreshes only report what moved
+
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
 import argparse, difflib, json, math, os, re, sys, time, datetime as dt
 from collections import defaultdict
+
 import numpy as np, pandas as pd, requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +31,7 @@ import mbm_checks as CHK
 # freshness.py and mbm_checks.py are in the guard because this runner now wires the
 # freshness guard and the check harness; the FR.guard(reporter=) call needs the
 # 2026-08-09 freshness at runtime.
-SHARED_MIN = "2026-08-02" # mma_board two-row form; this runner does not call line()
+SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
 for _mod in (BF, notify, tg_delta, FR, CHK):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
@@ -46,18 +49,22 @@ LOGS = os.path.join(HERE, "logs")
 SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_THROUGH = SPEC["train_through"]
+
 # Cards are announced weeks out but only firm up in the last few days, and everything
 # beyond the imminent card is noise on a board pushed daily. Five days covers Friday
 # evening through the following Wednesday from any run.
 HORIZON_DAYS = 5
+
 # How near a result must sit to a logged fight's date to be its result. Rematches of the
 # same pair are months apart, so this cleanly separates them; a fight and its own result
 # share a date to within a day.
 REMATCH_TOL_DAYS = 45
+
 # Tracks board_format rather than restating it. This is the console-side copy, and a
 # local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
 # quoted different prices for the same game.
 MIN_EDGE = BF.MIN_EDGE
+
 
 def preflight():
     """Fail loudly and usefully if a committed data file is missing. The import guard in
@@ -75,9 +82,11 @@ def preflight():
         print(f"\nrepo root currently contains: {sorted(os.listdir(HERE))}")
         sys.exit(1)
 
+
 def min_odds(p):
     p = min(max(float(p), 0.01), 0.99)
     return math.ceil((1 + MIN_EDGE) / p * 100) / 100.0
+
 
 # ------------------------------------------------------------------ refresh
 def refresh_results(days_back=75):
@@ -143,6 +152,7 @@ def refresh_results(days_back=75):
     print(f"results refreshed: +{len(N)} bouts from {len(recent)} recent events")
     return F
 
+
 def _method(s):
     t = str(s).lower()
     for k, v in (("no contest", "NC"), ("draw", "Draw"), ("technical submission", "SUB"),
@@ -150,6 +160,7 @@ def _method(s):
         if k in t:
             return v
     return "KO" if t.startswith("ko") else "OTHER"
+
 
 def fetch_upcoming(today):
     """ESPN is the only feed that lists fights before they happen.
@@ -188,6 +199,7 @@ def fetch_upcoming(today):
                          "sched": c.get("format", {}).get("regulation", {}).get("periods", 3)})
     return pd.DataFrame(rows), True
 
+
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
     chk = CHK.Reporter("MMA", today.strftime("%Y%m%d"))
@@ -198,11 +210,13 @@ def run(today_str):
     # Freshness. MMA never wired this before: freshness.py sat in the repo unused, so the
     # board priced fights with no check that the Wikipedia results history was current.
     # ESPN's mma/ufc scoreboard lists completed cards, so probe it against the newest bout
-    # the history holds. Weekly cards -> grace 7. season_types=None because UFC events do
-    # not carry the 1/2/3 US season convention. reporter=chk registers the guard, which is
+    # the history holds. grace 40: cards are weekly (median gap 6d) but the holiday break
+    # after 2025-12-20 ran 35 days, and blocking a healthy board because the probe was
+    # throttled during a legitimate gap is a real cost. season_types=None because the
+    # field is present but not meaningful for MMA. reporter=chk registers the guard, which is
     # what require("freshness") verifies actually ran.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=7, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
 
     up, _feed_ok = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
@@ -368,13 +382,13 @@ def run(today_str):
     log["result"], log["went_dist"] = g[0], g[1]
     # Anything past its date and still ungraded. Silence here used to mean the bout simply
     # never appeared in the rolling metrics, with nothing to say why.
-    _cut = (pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=2))
+    _cut = (pd.Timestamp.now('UTC').tz_localize(None) - pd.Timedelta(days=2))
     _stale = log[log.result.isna() & (pd.to_datetime(log.date, errors="coerce") < _cut)]
     if len(_stale):
         print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
               f"result:")
         for _, _r in _stale.sort_values("date").tail(8).iterrows():
-            print(f"  {_r.date} {_r.A} vs {_r.B}")
+            print(f"  {_r.date}  {_r.A} vs {_r.B}")
 
     # ---- invariant checks, before anything is persisted or published ----
     if len(board):
@@ -382,7 +396,8 @@ def run(today_str):
     chk.column_contract("result", log.result, "binary")
     chk.column_contract("went_dist", log.went_dist, "binary")
     chk.column_contract("p_win_a", log.p_win_a, "prob")
-    chk.model_identity(log.model.dropna().unique(), SPEC.get("model", "v1"))
+    chk.model_identity(log.model.dropna().unique(),
+                       SPEC.get("model_tags", [SPEC.get("model", "v1")]))
     if rows:
         chk.log_board_agreement(pushed_ids=[r["fight_id"] for r in rows],
                                 logged_ids_today=log.fight_id)
@@ -391,6 +406,7 @@ def run(today_str):
     chk.finish(strict=True, require=["freshness"])
 
     log.to_csv(pred_path, index=False)
+
     dec = log[log.result.isin([0.0, 1.0])]
     if len(dec) >= 30:
         y = dec.result.astype(int).values
@@ -398,20 +414,20 @@ def run(today_str):
         print(f"\nrolling grade (n={len(y)}):")
         pc = np.clip(dec.p_win_a.values.astype(float), 1e-6, 1-1e-6)
         from sklearn.metrics import log_loss
-        print(f"  moneyline: LL={log_loss(y, pc):.4f} base={log_loss(y, np.full(len(y), base)):.4f} "
+        print(f"  moneyline: LL={log_loss(y, pc):.4f}  base={log_loss(y, np.full(len(y), base)):.4f}  "
               f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
         dd = dec[dec.went_dist.notna()]
         if len(dd) >= 30:
             yd = dd.went_dist.astype(int).values
             pd_ = np.clip(dd.p_distance.values.astype(float), 1e-6, 1-1e-6)
-            print(f"  distance : LL={log_loss(yd, pd_):.4f} base="
+            print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
         w = dec.tail(200)
         if len(w) >= 200:
             yy = w.result.astype(int).values
             edge = log_loss(yy, np.full(len(yy), base)) - \
                 log_loss(yy, np.clip(w.p_win_a.values.astype(float), 1e-6, 1-1e-6))
-            print(f"  last-200 edge vs base: {edge:+.4f} "
+            print(f"  last-200 edge vs base: {edge:+.4f}  "
                   f"[{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
             if edge <= 0:
                 alerts.append("MMA moneyline")
@@ -429,7 +445,7 @@ def run(today_str):
             if not combo:
                 skipped += 1
                 continue
-            block = [f"{r['date']} {r['game']}"] + combo
+            block = [f"{r['date']}  {r['game']}"] + combo
             push[r["fight_id"]] = {"line": "\n".join(block),
                                    "min_odds": BF.min_odds(r["p"]),
                                    # Carries BOTH the matchup and the side. The matchup
@@ -466,6 +482,7 @@ def run(today_str):
         print("no board to send")
     else:
         print("board unchanged since the last push, nothing sent")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
