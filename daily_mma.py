@@ -39,7 +39,7 @@ for _mod in (BF, notify, tg_delta, FR, CHK):
 WIKI = "https://en.wikipedia.org/w/api.php"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
 WH = {"User-Agent": "MBM-forecasting/1.0 (contact: maparsons4@gmail.com)"}
-EH = {"User-Agent": "Mozilla/5.0"}
+EH = {}          # ESPN 403s any custom User-Agent; only the default requests UA works
 FIGHTS = os.path.join(HERE, "data", "fights_clean.csv")
 ATTRS = os.path.join(HERE, "data", "attrs.csv")
 LOGS = os.path.join(HERE, "logs")
