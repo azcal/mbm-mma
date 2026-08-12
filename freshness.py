@@ -10,6 +10,14 @@ availability features. The board published anyway and nothing said a word.
 is perfectly current. The test that means something is whether the live source knows about
 a completed game the local history does not. That is what `check` asks.
 
+**A probe can also count events the history is not built to hold.** (2026-08-12) ESPN files
+Dana White's Contender Series under `mma/ufc`, but the MMA history is scraped from
+Wikipedia's "List of UFC events", which does not include it -- measured, zero Contender
+Series bouts among 10,216. So every DWCS card made the probe report the board stale against
+an event it can never ingest, and MMA blocked every Tuesday of the DWCS season. `exclude`
+filters those out, the same job `season_types` does for NFL preseason: a probe must count
+only what the history is able to contain.
+
 **A probe that fails is not a probe that found nothing.** (2026-08-09) The old `_completed_on`
 returned 0 both when a day had no games AND when the ESPN call errored or was rate-limited.
 So a throttled run reported every board FRESH and stamped "complete" on data that was nine
@@ -20,21 +28,22 @@ depends on how old the local history already is (see `_verdict`).
 
 Usage in a runner, after the history is loaded and before anything is boarded:
 
-ok, msg, status = FR.check("WNBA", newest_local_date, "basketball/wnba")
-print(msg)
-if not ok and not FR.override():
-raise SystemExit("refusing to board on stale data")
+    ok, msg, status = FR.check("WNBA", newest_local_date, "basketball/wnba")
+    print(msg)
+    if not ok and not FR.override():
+        raise SystemExit("refusing to board on stale data")
 
 Set MBM_ALLOW_STALE=1 to board anyway, which is there for the day a source changes shape
 and the check is wrong rather than the data.
 """
 import datetime as dt
 import os
+import re
 import time
 
 import requests
 
-VERSION = "2026-08-09"
+VERSION = "2026-08-12"
 
 # ESPN 403s any custom User-Agent. See the note in espn_roster.py.
 H = {}
@@ -52,6 +61,25 @@ LIVE_TYPES = (2, 3)
 
 # Never walk more than this many days looking for the gap.
 MAX_WALK = 40
+
+
+def _excluded(event, exclude):
+    """True if this event is one the board's history cannot hold, so it must not count.
+
+    `exclude` is a regex matched case-insensitively against the event name, or a callable
+    taking the raw event dict. Anything the model structurally never ingests belongs here:
+    a probe counting fixtures the history is not built to contain reports staleness that
+    no amount of refreshing can ever clear.
+    """
+    if exclude is None:
+        return False
+    if callable(exclude):
+        try:
+            return bool(exclude(event))
+        except Exception:
+            return False
+    name = f"{event.get('name', '')} {event.get('shortName', '')}"
+    return bool(re.search(exclude, name, re.I))
 
 # Transient-error handling for a single day's probe.
 PROBE_RETRIES = 2          # 3 attempts total
@@ -86,7 +114,8 @@ def override():
     return os.environ.get("MBM_ALLOW_STALE", "").strip() in ("1", "true", "yes")
 
 
-def _completed_on(slug, day, season_types, timeout=25, retries=PROBE_RETRIES):
+def _completed_on(slug, day, season_types, timeout=25, retries=PROBE_RETRIES,
+                  exclude=None):
     """Number of completed events on `day`, or None if the probe could not be completed.
 
     None is the whole point of the 2026-08-09 fix: it is distinct from 0. A non-200
@@ -113,12 +142,15 @@ def _completed_on(slug, day, season_types, timeout=25, retries=PROBE_RETRIES):
             if season_types is not None and \
                (e.get("season", {}) or {}).get("type") not in season_types:
                 continue
+            if _excluded(e, exclude):
+                continue
             n += 1
         return n
     return None
 
 
-def newest_completed(slug, lookback=LOOKBACK_DAYS, season_types=LIVE_TYPES, timeout=25):
+def newest_completed(slug, lookback=LOOKBACK_DAYS, season_types=LIVE_TYPES, timeout=25,
+                     exclude=None):
     """(date, count, probe_failed) for the most recent completed event, walking back.
 
     If a completed day is found, the answer is reliable and probe_failed is False. If no
@@ -130,7 +162,7 @@ def newest_completed(slug, lookback=LOOKBACK_DAYS, season_types=LIVE_TYPES, time
     errored = False
     for back in range(lookback + 1):
         day = today - dt.timedelta(days=back)
-        n = _completed_on(slug, day, season_types, timeout)
+        n = _completed_on(slug, day, season_types, timeout, exclude=exclude)
         if n is None:
             errored = True
             continue
@@ -139,7 +171,8 @@ def newest_completed(slug, lookback=LOOKBACK_DAYS, season_types=LIVE_TYPES, time
     return None, 0, errored
 
 
-def missed_games(slug, since, until=None, season_types=LIVE_TYPES, timeout=25):
+def missed_games(slug, since, until=None, season_types=LIVE_TYPES, timeout=25,
+                 exclude=None):
     """(total, last, probe_failed): completed events after `since`, and the last date.
 
     probe_failed is True only when freshness could not be determined at all (the newest
@@ -147,7 +180,8 @@ def missed_games(slug, since, until=None, season_types=LIVE_TYPES, timeout=25):
     staleness is certain regardless of a hiccup later in the window, so probe_failed is
     False and only the count may undercount.
     """
-    newest, _, failed = newest_completed(slug, season_types=season_types, timeout=timeout)
+    newest, _, failed = newest_completed(slug, season_types=season_types, timeout=timeout,
+                                        exclude=exclude)
     if failed:
         return 0, None, True
     if newest is None or newest <= since:
@@ -157,7 +191,7 @@ def missed_games(slug, since, until=None, season_types=LIVE_TYPES, timeout=25):
     total, last, capped = 0, None, start > since + dt.timedelta(days=1)
     day = start
     while day <= until:
-        n = _completed_on(slug, day, season_types, timeout)
+        n = _completed_on(slug, day, season_types, timeout, exclude=exclude)
         if n:                       # None (probe error) counts as 0 here; staleness is
             total += n              # already established, this only affects the count
             last = day
@@ -202,7 +236,7 @@ def _verdict(label, local_newest, missed, last, status, max_missed=0,
 
 
 def check(label, local_newest, slug, max_missed=0, season_types=LIVE_TYPES,
-          grace_days=STALE_GRACE_DEFAULT):
+          grace_days=STALE_GRACE_DEFAULT, exclude=None):
     """(ok, message, verdict). Not ok when the source has games the history lacks, or when
     the probe could not be completed and the local history is already older than the grace.
 
@@ -213,7 +247,8 @@ def check(label, local_newest, slug, max_missed=0, season_types=LIVE_TYPES,
     if isinstance(local_newest, dt.datetime):
         local_newest = local_newest.date()
     try:
-        missed, last, failed = missed_games(slug, local_newest, season_types=season_types)
+        missed, last, failed = missed_games(slug, local_newest, season_types=season_types,
+                                            exclude=exclude)
     except Exception as ex:
         # An unexpected error is treated as an unverified probe, not as staleness.
         return _verdict(label, local_newest, 0, None, "unverified", max_missed, grace_days)
@@ -222,7 +257,7 @@ def check(label, local_newest, slug, max_missed=0, season_types=LIVE_TYPES,
 
 
 def check_multi(entries, season_types=LIVE_TYPES, precomputed=None,
-                grace_days=STALE_GRACE_DEFAULT, reporter=None):
+                grace_days=STALE_GRACE_DEFAULT, reporter=None, exclude=None):
     """Freshness across several leagues on one board.
 
     Returns (ok, lines). Not ok if ANY league is behind (or blocked-unverified), because a
@@ -247,7 +282,7 @@ def check_multi(entries, season_types=LIVE_TYPES, precomputed=None,
                                   grace_days=grace_days)
         else:
             ok, msg, v = check(label, newest, slug, season_types=season_types,
-                               grace_days=grace_days)
+                               grace_days=grace_days, exclude=exclude)
         ok_all &= ok
         lines.append(msg)
         if order.get(v, 0) > order.get(worst, 0):
@@ -257,7 +292,8 @@ def check_multi(entries, season_types=LIVE_TYPES, precomputed=None,
     return ok_all, lines
 
 
-def board_line(local_newest, slug=None, season_types=LIVE_TYPES, checked=None):
+def board_line(local_newest, slug=None, season_types=LIVE_TYPES, checked=None,
+               exclude=None):
     """One short line for the Discord footer, so the board carries its own provenance.
 
     `checked` may be (newest, missing) or (newest, missing, status) where status is
@@ -271,12 +307,12 @@ def board_line(local_newest, slug=None, season_types=LIVE_TYPES, checked=None):
         else:
             newest, missing = checked
     else:
-        missing, _, failed = missed_games(slug, local_newest, season_types=season_types)
+        missing, _, failed = missed_games(slug, local_newest, season_types=season_types,
+                                          exclude=exclude)
         newest = local_newest
         status = "unverified" if failed else "measured"
     if isinstance(newest, dt.datetime):
         newest = newest.date()
-
     if status == "unverified":
         return f"data through {newest} · freshness unverified, probe failed"
     yday = dt.date.today() - dt.timedelta(days=1)
@@ -296,19 +332,22 @@ def season_note(min_gp, full_at, label="both sides"):
 
 
 def guard(label, local_newest, slug, max_missed=0, season_types=LIVE_TYPES,
-          grace_days=STALE_GRACE_DEFAULT, reporter=None):
+          grace_days=STALE_GRACE_DEFAULT, reporter=None, exclude=None):
     """Print the verdict and stop the run if the data is stale or unverifiably old.
 
     Called after the history is loaded and before anything reaches a board, so a bad run
     produces no forecast at all rather than a forecast nobody should act on.
 
-    grace_days: longest normal gap for this board (~14 Big 5, ~7 MMA/CS2, 1-2 daily).
+    grace_days: longest normal gap for this board (~14 Big 5, ~40 MMA, ~7 CS2, 1-2 daily).
+    exclude: regex or callable marking events this board's history cannot hold, e.g.
+        r"Contender Series" for MMA. Without it a probe counts fixtures that can never be
+        ingested and the board blocks forever.
     reporter: pass the mbm_checks Reporter and this registers the freshness guard as having
     executed -- the only thing that satisfies require("freshness"), so wiring the guard and
     satisfying the requirement are the same act and cannot come apart.
     """
     ok, msg, verdict = check(label, local_newest, slug, max_missed, season_types,
-                             grace_days)
+                             grace_days, exclude=exclude)
     print(msg)
     if reporter is not None:
         reporter.register_guard("freshness", ok, msg, verdict)
