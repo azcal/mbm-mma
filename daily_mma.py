@@ -1,14 +1,17 @@
 """
 MBM MMA daily runner (rebuild v1, frozen spec).
+
 - Refreshes finished bouts from Wikipedia event pages (results, method, round, time)
 - Pulls upcoming UFC cards from ESPN, the only source that lists fights before they happen
 - Boards three markets: moneyline, goes-the-distance, and winner by method
 - Grades logged forecasts, prints rolling metrics, last-200 tripwire
 - Discord push routed through tg_delta so refreshes only report what moved
+
 Usage: python daily_mma.py [--date YYYY-MM-DD]
 """
 import argparse, difflib, json, math, os, re, sys, time, datetime as dt
 from collections import defaultdict
+
 import numpy as np, pandas as pd, requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +31,7 @@ import mbm_checks as CHK
 # freshness.py and mbm_checks.py are in the guard because this runner now wires the
 # freshness guard and the check harness; the FR.guard(reporter=) call needs the
 # 2026-08-09 freshness at runtime.
-SHARED_MIN = "2026-08-02" # mma_board two-row form; this runner does not call line()
+SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
 for _mod in (BF, notify, tg_delta, FR, CHK):
     _have = getattr(_mod, "VERSION", "")
     if _have < SHARED_MIN:
@@ -51,14 +54,17 @@ LOGS = os.path.join(HERE, "logs")
 SPEC = json.load(open(os.path.join(HERE, "spec.json")))
 CFG, C = SPEC["cfg"], SPEC["C"]
 TRAIN_THROUGH = SPEC["train_through"]
+
 # Cards are announced weeks out but only firm up in the last few days, and everything
 # beyond the imminent card is noise on a board pushed daily. Five days covers Friday
 # evening through the following Wednesday from any run.
 HORIZON_DAYS = 5
+
 # How near a result must sit to a logged fight's date to be its result. Rematches of the
 # same pair are months apart, so this cleanly separates them; a fight and its own result
 # share a date to within a day.
 REMATCH_TOL_DAYS = 45
+
 # Input-adequacy floor, NOT a probability band. A market priced at a coin flip means two
 # opposite things: a genuine 50/50 between established fighters (a real forecast, worth
 # publishing) or "no data" for debutants (the prior returned unchanged). The probability
@@ -68,6 +74,7 @@ REMATCH_TOL_DAYS = 45
 # coin flips. Same shape as the engines' shrink, applied where the thinness is still
 # measurable. Withheld fights are still forecast, logged and graded (only held from Discord).
 ADEQ_MIN_BOUTS = 3
+
 # Closeness band: a DISPLAY rule, not suppression, and MMA-specific. On a genuine even fight
 # between two fighters with real records the model's separation is within noise, and the side
 # named is only ESPN's competitor order (f1 = names[0]), so "A 50.3%" is a coin toss reported
@@ -82,10 +89,12 @@ ADEQ_MIN_BOUTS = 3
 # behaves (66.7% vs 64.4% expected). n is only ~100 below 0.55 and thin. Re-measure after
 # another season.
 CLOSE_BAND = 0.05
+
 # Tracks board_format rather than restating it. This is the console-side copy, and a
 # local 0.05 here while board_format ran at 0.00 meant the Actions log and Discord
 # quoted different prices for the same game.
 MIN_EDGE = BF.MIN_EDGE
+
 
 def preflight():
     """Fail loudly and usefully if a committed data file is missing. The import guard in
@@ -103,9 +112,11 @@ def preflight():
         print(f"\nrepo root currently contains: {sorted(os.listdir(HERE))}")
         sys.exit(1)
 
+
 def min_odds(p):
     p = min(max(float(p), 0.01), 0.99)
     return math.ceil((1 + MIN_EDGE) / p * 100) / 100.0
+
 
 # ------------------------------------------------------------------ refresh
 def refresh_results(days_back=75):
@@ -171,6 +182,7 @@ def refresh_results(days_back=75):
     print(f"results refreshed: +{len(N)} bouts from {len(recent)} recent events")
     return F
 
+
 def _method(s):
     t = str(s).lower()
     for k, v in (("no contest", "NC"), ("draw", "Draw"), ("technical submission", "SUB"),
@@ -178,6 +190,7 @@ def _method(s):
         if k in t:
             return v
     return "KO" if t.startswith("ko") else "OTHER"
+
 
 def fetch_upcoming(today):
     """ESPN is the only feed that lists fights before they happen.
@@ -216,6 +229,7 @@ def fetch_upcoming(today):
                          "sched": c.get("format", {}).get("regulation", {}).get("periods", 3)})
     return pd.DataFrame(rows), True
 
+
 def run(today_str):
     today = dt.datetime.strptime(today_str, "%Y-%m-%d").date()
     chk = CHK.Reporter("MMA", today.strftime("%Y%m%d"))
@@ -231,8 +245,16 @@ def run(today_str):
     # shorter grace would block a healthy board on a throttled probe in late December.
     # season_types=None because UFC events do not carry the 1/2/3 US season convention.
     # reporter=chk registers the guard, which is what require("freshness") verifies ran.
+    #
+    # exclude: ESPN files Dana White's Contender Series under mma/ufc, but refresh_results
+    # scrapes Wikipedia's "List of UFC events", which does not include it -- measured, zero
+    # Contender Series bouts among 10,216 in the history. So every DWCS card made the probe
+    # report the board stale against an event it can never ingest, and MMA blocked every
+    # Tuesday of the DWCS season with no refresh able to clear it. Same job season_types
+    # does for NFL preseason: a probe must count only what the history is able to contain.
     _newest = pd.to_datetime(F.date).max().date() if len(F) else None
-    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None, reporter=chk)
+    FR.guard("MMA", _newest, "mma/ufc", grace_days=40, season_types=None,
+             exclude=r"Contender Series", reporter=chk)
 
     up, _feed_ok = fetch_upcoming(today)
     print(f"upcoming fights in {HORIZON_DAYS}d: {len(up)}")
@@ -434,7 +456,7 @@ def run(today_str):
         print(f"{len(_stale)} bout(s) fought but still ungraded, names not matched to a "
               f"result:")
         for _, _r in _stale.sort_values("date").tail(8).iterrows():
-            print(f"  {_r.date} {_r.A} vs {_r.B}")
+            print(f"  {_r.date}  {_r.A} vs {_r.B}")
 
     # ---- invariant checks, before anything is persisted or published ----
     if len(board):
@@ -460,6 +482,7 @@ def run(today_str):
     chk.finish(strict=True, require=["freshness"])
 
     log.to_csv(pred_path, index=False)
+
     dec = log[log.result.isin([0.0, 1.0])]
     if len(dec) >= 30:
         y = dec.result.astype(int).values
@@ -467,20 +490,20 @@ def run(today_str):
         print(f"\nrolling grade (n={len(y)}):")
         pc = np.clip(dec.p_win_a.values.astype(float), 1e-6, 1-1e-6)
         from sklearn.metrics import log_loss
-        print(f"  moneyline: LL={log_loss(y, pc):.4f} base={log_loss(y, np.full(len(y), base)):.4f} "
+        print(f"  moneyline: LL={log_loss(y, pc):.4f}  base={log_loss(y, np.full(len(y), base)):.4f}  "
               f"hit={np.mean((pc > .5) == (y == 1)):.3f}")
         dd = dec[dec.went_dist.notna()]
         if len(dd) >= 30:
             yd = dd.went_dist.astype(int).values
             pd_ = np.clip(dd.p_distance.values.astype(float), 1e-6, 1-1e-6)
-            print(f"  distance : LL={log_loss(yd, pd_):.4f} base="
+            print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
         w = dec.tail(200)
         if len(w) >= 200:
             yy = w.result.astype(int).values
             edge = log_loss(yy, np.full(len(yy), base)) - \
                 log_loss(yy, np.clip(w.p_win_a.values.astype(float), 1e-6, 1-1e-6))
-            print(f"  last-200 edge vs base: {edge:+.4f} "
+            print(f"  last-200 edge vs base: {edge:+.4f}  "
                   f"[{'OK' if edge > 0 else 'TRIPWIRE: bench review'}]")
             if edge <= 0:
                 alerts.append("MMA moneyline")
@@ -558,6 +581,7 @@ def run(today_str):
         print("no board to send")
     else:
         print("board unchanged since the last push, nothing sent")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
