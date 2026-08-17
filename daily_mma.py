@@ -429,8 +429,12 @@ def run(today_str):
                 # other line on this board quotes min_odds(). Passing _mp printed
                 # "find 6.94 / 117" where the fair price is +594.
                 _mdec = min_odds(_mp)
+                # Two-space prefix, same as every line BF.mma_board returns. notify
+                # keys the price-line rendering on that indent; without it the method
+                # line came through as plain text while ML and DIST rendered as
+                # subtext with backticked prices.
                 combo = list(combo) + [
-                    f"{_mlbl}  {_mp*100:.1f}%  find {_mdec:.2f} / "
+                    f"  {_mlbl}  {_mp*100:.1f}%  find {_mdec:.2f} / "
                     f"{BF.american(_mdec)} or better"]
             for ln in combo:
                 print("  " + ln)
