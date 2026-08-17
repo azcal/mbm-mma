@@ -425,9 +425,13 @@ def run(today_str):
             # and the lift measures the method departure on its own. A coin-flip moneyline
             # does not make "A by SUB at 1.8x its base rate" meaningless.
             if meth and n_min >= ADEQ_MIN_BOUTS:
+                # BF.american() takes DECIMAL odds, not a probability, and every
+                # other line on this board quotes min_odds(). Passing _mp printed
+                # "find 6.94 / 117" where the fair price is +594.
+                _mdec = min_odds(_mp)
                 combo = list(combo) + [
-                    f"{_mlbl}  {_mp*100:.1f}%  find {1/_mp:.2f} / "
-                    f"{BF.american(_mp)} or better"]
+                    f"{_mlbl}  {_mp*100:.1f}%  find {_mdec:.2f} / "
+                    f"{BF.american(_mdec)} or better"]
             for ln in combo:
                 print("  " + ln)
             b.loc[b.fight_id == r.fight_id, "meth_pick"] = meth[0] if meth else None
@@ -437,7 +441,7 @@ def run(today_str):
                          "pick": ("too close to call" if close_display else fav),
                          "p": pf, "fight_id": r.fight_id, "combo": combo,
                          "n_min": n_min, "close": bool(r.close)})
-        for _c in ("meth_pick", "meth_p", "meth_base"):
+        for _c in ("meth_pick", "meth_p", "meth_base", "meth_hit"):
             if _c not in log.columns:
                 log[_c] = np.nan
         keep = [c for c in log.columns if c in b.columns]
@@ -459,7 +463,8 @@ def run(today_str):
     for r in F.itertuples():
         a, bb = sorted([E.norm_name(r.f1), E.norm_name(r.f2)])
         k = f"{a}|{bb}"
-        won[k].append((pd.to_datetime(r.date), E.norm_name(r.f1), bool(r.distance)))
+        won[k].append((pd.to_datetime(r.date), E.norm_name(r.f1), bool(r.distance),
+                       str(getattr(r, "m", "")).replace("TKO", "KO")))
         keys.append(k)
 
     def _resolve(k, row_date):
@@ -471,11 +476,11 @@ def run(today_str):
         if not lst:
             return None
         if len(lst) == 1:
-            return lst[0][1], lst[0][2]
+            return lst[0][1], lst[0][2], lst[0][3]
         rd = pd.to_datetime(row_date)
-        d0, winner, dist = min(lst, key=lambda x: abs((x[0] - rd).days))
+        d0, winner, dist, mth = min(lst, key=lambda x: abs((x[0] - rd).days))
         if abs((d0 - rd).days) <= REMATCH_TOL_DAYS:
-            return winner, dist
+            return winner, dist, mth
         return None
 
     def close_key(k):
@@ -508,21 +513,34 @@ def run(today_str):
         if hit is None:
             alt = close_key(k)
             if alt is None:
-                return (np.nan, np.nan)
+                return (np.nan, np.nan, np.nan)
             hit = _resolve(alt, row.date)
             if hit is None:
-                return (np.nan, np.nan)
+                return (np.nan, np.nan, np.nan)
             fuzzy.append(f"{row.A} vs {row.B} -> {alt.replace('|', ' vs ')}")
-        winner, dist = hit
+        winner, dist, mth = hit
+
+        def _mh(res_a):
+            """Did the posted method pick land? It names a fighter AND a method,
+            so both have to match. NaN when no pick was posted for this bout."""
+            mp = getattr(row, "meth_pick", None)
+            if not isinstance(mp, str) or " by " not in mp:
+                return np.nan
+            want_who, want_m = mp.rsplit(" by ", 1)
+            got_who = row.A if res_a == 1.0 else row.B
+            return float(E.norm_name(want_who) == E.norm_name(got_who)
+                         and want_m.strip().upper() == str(mth).strip().upper())
+
         # Compare the winner to row.A directly rather than to whichever name sorts first.
         na, nb = E.norm_name(row.A), E.norm_name(row.B)
         if winner == na:
-            return (1.0, dist)
+            return (1.0, dist, _mh(1.0))
         if winner == nb:
-            return (0.0, dist)
+            return (0.0, dist, _mh(0.0))
         # Matched fuzzily, so the winner string may be a variant of either name.
-        return (1.0 if difflib.SequenceMatcher(None, winner, na).ratio()
-                > difflib.SequenceMatcher(None, winner, nb).ratio() else 0.0, dist)
+        _r = (1.0 if difflib.SequenceMatcher(None, winner, na).ratio()
+              > difflib.SequenceMatcher(None, winner, nb).ratio() else 0.0)
+        return (_r, dist, _mh(_r))
 
     g = log.apply(grade, axis=1, result_type="expand")
     if fuzzy:
@@ -530,6 +548,7 @@ def run(today_str):
         for f in fuzzy[:6]:
             print(f"  {f}")
     log["result"], log["went_dist"] = g[0], g[1]
+    log["meth_hit"] = g[2] if g.shape[1] > 2 else np.nan
     # Anything past its date and still ungraded. Silence here used to mean the bout simply
     # never appeared in the rolling metrics, with nothing to say why.
     _cut = (pd.Timestamp.now("UTC").tz_localize(None) - pd.Timedelta(days=2))
@@ -581,7 +600,7 @@ def run(today_str):
             print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
         # method market: graded only on rows where a pick was actually posted
-        if "meth_pick" in dec.columns:
+        if {"meth_pick", "meth_hit"} <= set(dec.columns):
             dm = dec[dec.meth_pick.notna() & dec.meth_hit.notna()]
             if len(dm) >= 30:
                 ym = dm.meth_hit.astype(int).values
