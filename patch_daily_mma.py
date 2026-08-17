@@ -72,12 +72,12 @@ def _meth_base_rates(Dall, tr):
 
 
 def _meth_pick(r, base_tbl, glob, lift_min=METH_LIFT_MIN):
-    """Return (label, p, base, lift) or None when nothing clears the bar."""
+    """Return (pick_or_None, best_lift). pick is (label, p, base, lift)."""
     P = np.array([r.p_a_ko, r.p_a_sub, r.p_a_dec,
                   r.p_b_ko, r.p_b_sub, r.p_b_dec], dtype=float)
     s = P.sum()
     if not np.isfinite(s) or s <= 0:
-        return None
+        return None, 0.0
     P = P / s
     pa = float(r.p_win_a)
     ko, sb, dc = base_tbl.get((r.wt, int(r.sched)), glob)
@@ -86,23 +86,31 @@ def _meth_pick(r, base_tbl, glob, lift_min=METH_LIFT_MIN):
     B = B / B.sum()
     lift = np.where((P >= METH_LO) & (P <= METH_HI), P / np.maximum(B, 1e-9), -1.0)
     j = int(lift.argmax())
+    best = float(max(lift.max(), 0.0))
     if lift[j] < lift_min:
-        return None
+        return None, best
     cls = METH_CLASSES[j]
     who = r.A if cls.startswith("A_") else r.B
-    return (f"{who} by {cls.split('_')[1]}", float(P[j]), float(B[j]), float(lift[j]))
+    return (f"{who} by {cls.split('_')[1]}", float(P[j]), float(B[j]), float(lift[j])), best
 # --- end MBM method market ---
 
 '''
 
-BOARD_CALL = '''            meth = _meth_pick(r, _meth_base, _meth_glob)
+BOARD_CALL = '''            meth, _mbest = _meth_pick(r, _meth_base, _meth_glob)
             if meth:
                 _mlbl, _mp, _mb, _mlift = meth
                 print(f"  METH {_mlbl} {_mp:.3f} -> needs {min_odds(_mp):.2f}"
                       f"  (base {_mb:.3f}, {_mlift:.2f}x)")
+            else:
+                # Always emit a line. Silence cannot be told apart from an unapplied patch.
+                print(f"  METH no edge (best {_mbest:.2f}x, need {METH_LIFT_MIN:.2f}x)")
 '''
 
-COMBO_APPEND = '''            if meth and not close_display and n_min >= ADEQ_MIN_BOUTS:
+COMBO_APPEND = '''            # close_display suppresses the WINNER market only. The method pick's lift is
+            # computed against a base that also carries p_win_a, so the winner lean cancels
+            # and the lift measures the method departure on its own. A coin-flip moneyline
+            # does not make "A by SUB at 1.8x its base rate" meaningless.
+            if meth and n_min >= ADEQ_MIN_BOUTS:
                 combo = list(combo) + [
                     f"{_mlbl}  {_mp*100:.1f}%  find {1/_mp:.2f} / "
                     f"{BF.american(_mp)} or better"]
@@ -170,6 +178,18 @@ def patch(path):
         f'{ind}b.loc[b.fight_id == r.fight_id, "meth_base"] = meth[2] if meth else np.nan\n'
     ) + out[m3.start():]
 
+    # 5b. the log merge keeps only columns ALREADY in log, so new fields are
+    #     silently dropped on every run. Seed them before the merge.
+    m3b = re.search(r"([ ]+)keep = \[c for c in log\.columns if c in b\.columns\]\n", out)
+    if not m3b:
+        print("FAIL: could not locate the log merge"); return 1
+    ind2 = m3b.group(1)
+    out = out[:m3b.start()] + (
+        f'{ind2}for _c in ("meth_pick", "meth_p", "meth_base"):\n'
+        f'{ind2}    if _c not in log.columns:\n'
+        f'{ind2}        log[_c] = np.nan\n'
+    ) + out[m3b.start():]
+
     # 6. rolling grade for the method market
     m4 = re.search(r"[ ]+w = dec\.tail\(200\)\n", out)
     if not m4:
@@ -185,10 +205,36 @@ def patch(path):
     return 0
 
 
+def verify(path):
+    """Prove whether the patch is live in the file that actually runs."""
+    src = open(path, encoding="utf-8").read()
+    need = [
+        ("helpers", "def _meth_pick("),
+        ("base-rate table", "_meth_base, _meth_glob = _meth_base_rates("),
+        ("console METH line", 'print(f"  METH '),
+        ("discord combo append", "combo = list(combo) + ["),
+        ("log columns seeded", 'for _c in ("meth_pick", "meth_p", "meth_base")'),
+        ("rolling grade", 'print(f"  method   : LL='),
+    ]
+    ok = True
+    print(f"verifying {path}")
+    for name, token in need:
+        hit = token in src
+        ok &= hit
+        print(f"  [{'OK ' if hit else 'MISSING'}] {name}")
+    print("\nPATCH IS LIVE" if ok else "\nPATCH NOT APPLIED to this file")
+    if ok:
+        print("If you still see no METH line in the console, the file you ran is not")
+        print("this one. Check the working directory and any second copy in the repo.")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
     p = sys.argv[1]
+    if "--verify" in sys.argv:
+        sys.exit(verify(p))
     if "--revert" in sys.argv:
         if os.path.exists(p + ".bak"):
             shutil.move(p + ".bak", p); print("reverted"); sys.exit(0)

@@ -1,99 +1,90 @@
-# daily_mma.py already had the method market
+# Method market: what was wrong
 
-The docstring on line 6 says it:
-
-```
-- Boards three markets: moneyline, goes-the-distance, and winner by method
-```
-
-Line 344 already computes it:
-
-```python
-combo = BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
-                     r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B)
-```
-
-`E.predict()` returns the full 6-way distribution. Your engine has been
-producing method probabilities the whole time. `BF.mma_board()` collapses
-those six numbers into the two-row form (winner + distance) and throws the
-method split away. Your own comment on line 33 records this:
-
-```python
-SHARED_MIN = "2026-08-02"   # mma_board two-row form; this runner does not call line()
-```
-
-So the third market was never missing. It was computed, discarded at render,
-and never graded.
-
-That last part is the real finding. The rolling block grades moneyline and
-distance only:
-
-```
-rolling grade (n=329):
-  moneyline: LL=0.6505  base=0.6934  hit=0.620
-  distance : LL=0.6748  base=0.6881
-```
-
-No method line. Your method head has been running ungraded for 329 bouts.
-You have no idea whether it works.
-
-## Apply
+## First, verify
 
 ```bash
-python patch_daily_mma.py daily_mma.py     # writes daily_mma.py.bak
-python patch_daily_mma.py daily_mma.py --revert
+python patch_daily_mma.py daily_mma.py --verify
 ```
 
-Idempotent, compiles clean against your file. Six edits:
+Prints OK/MISSING for all six edits and tells you plainly whether the patch is
+live in the file you are running. If it says NOT APPLIED, that is the whole
+answer and nothing below matters yet.
 
-1. `_meth_base_rates()` and `_meth_pick()` helpers before `preflight()`
-2. base-rate table built after `E.fit_heads()`
-3. `METH` console line after the `DIST` print
-4. method line appended to the Discord `combo`
-5. `meth_pick` / `meth_p` / `meth_base` persisted to the log
-6. method added to the rolling grade block, with a running-hot tripwire
+```bash
+python patch_daily_mma.py daily_mma.py            # apply, backup at .bak
+python patch_daily_mma.py daily_mma.py --revert   # undo
+```
 
-New console output:
+## Two bugs in the first patch
+
+**The method line was suppressed on every close bout.** The combo condition
+was `if meth and not close_display`. Four of your seven boarded fights are
+"too close to call" (Nzechukwu, Mederos, De Ridder, Hernandez), so the method
+pick was dropped from Discord on all of them. Hernandez by SUB was the one
+pick that cleared the bar on your slate, and it is a close fight, so the board
+came out identical to before.
+
+This was wrong on the merits too. `CLOSE_BAND` exists because at p_win_a ~ 0.50
+the side named is only ESPN's competitor order. But the method pick's lift is
+`P[j] / (base_method * p_win_a)`, so the winner lean cancels and the lift
+measures the method departure on its own. A coin-flip moneyline does not make
+"A by SUB at 1.8x its base rate" meaningless. Condition is now just
+`if meth and n_min >= ADEQ_MIN_BOUTS`.
+
+**The method columns never persisted.** Your log merge is:
+
+```python
+keep = [c for c in log.columns if c in b.columns]
+```
+
+That keeps only columns already in the log. `meth_pick` is not there on the
+first run, so it was dropped every time and grading could never begin. The
+patch now seeds the three columns before the merge.
+
+## Silence is no longer ambiguous
+
+The console now always prints a METH line:
 
 ```
-2026-08-22  Anthony Hernandez vs Gregory Rodrigues  (Middleweight, 5r)
-  ML   too close to call (p_win_a 0.539, within 0.05 of 0.50)
-  DIST goes the distance 0.258 -> needs 3.88  | inside 0.742 -> needs 1.35
   METH Anthony Hernandez by SUB 0.129 -> needs 7.75  (base 0.071, 1.82x)
+  METH no edge (best 1.21x, need 1.35x)
 ```
 
-## One thing left for you
+If you see neither, the patch is not running in the file you executed. That
+was the ambiguity that cost the last two rounds.
 
-`meth_hit` is not wired. Your `grade()` returns `(result, went_dist)` and the
-method pick names a fighter **and** a method, so grading it needs the result
-method too. You already parse that in `refresh_results()` via `_method()`, and
-it lands in the `m` column. Extend `grade()` to return a third value:
-whether `meth_pick` matched both the winner and the mapped method. Until
-then the method grade block stays silent and everything else runs.
+## Your daily_mma.py already had this market
 
-Note `_method()` returns `KO` and `TKO` separately; the patch maps `TKO -> KO`
-when computing base rates, so do the same when grading.
+Docstring line 6: `Boards three markets: moneyline, goes-the-distance, and
+winner by method`. Line 344 computes it. `E.predict()` has been returning the
+full 6-way distribution all along; `BF.mma_board()` collapses it to the
+two-row form and discards the method split, which your own line 33 comment
+records.
 
-## Why not argmax
+The market was computed, dropped at render, and never graded. Your rolling
+block reports moneyline and distance only, so the method head has run
+ungraded for 329 bouts.
 
-Argmax posts whichever outcome is most likely, which is whichever has the
-highest base rate, which is decisions. Measured on 4,695 fights it scores
-**1.03x lift** and never once selects a submission. The patch uses the rule
-that departs most from the division base rate inside the calibrated band:
-**1.86x lift**, posting on 9-14% of bouts. Backtest in BOARD.md, band in
-CALIBRATION.md.
+## Still yours to wire
 
-`METH_LIFT_MIN = 1.35` is the volume knob. 1.20 posts ~44% of bouts at 1.53x.
-Calibration holds across the range, so it is purely volume against signal.
+`meth_hit`. `grade()` returns `(result, went_dist)`; a method pick names a
+fighter **and** a method, so it needs the result method too. You already parse
+that in `refresh_results()` via `_method()` into column `m`. Extend `grade()`
+to return a third value. `_method()` emits `KO` and `TKO` separately and the
+patch maps `TKO -> KO` for base rates, so match that when grading.
 
-## This uses YOUR engine, not the hazard model
+Until then the method grade line stays silent and everything else runs.
 
-The patch reads `r.p_a_ko` etc. straight from `E.predict()`. That is
-deliberate: grade your own method head first, because it is right there and
-has never been measured. If it comes in under about 1.4x lift after a season,
-`mbm_mma_method.py` is the drop-in replacement and INTEGRATION.md covers the
-swap.
+## Selection rule
 
-`method_board.py` (the stdout parser) is now redundant if you apply this
-patch. Keep it only if you want to compare the two models side by side on the
-same slate.
+Not argmax. Argmax posts whichever outcome has the highest base rate, which is
+decisions: measured **1.03x lift** over 4,695 fights, and it never once selects
+a submission. The patch posts the outcome departing most from the division
+base rate inside the calibrated band: **1.86x lift**, firing on 9-14% of
+bouts. `METH_LIFT_MIN = 1.35` is the volume knob; 1.20 posts ~44% at 1.53x.
+Backtest in BOARD.md, trust band in CALIBRATION.md.
+
+Reads `r.p_a_ko` etc. from your engine, not the hazard model. Grade your own
+head first since it is already there and has never been measured. If it lands
+under ~1.4x lift after a season, `mbm_mma_method.py` is the drop-in and
+INTEGRATION.md covers the swap.
