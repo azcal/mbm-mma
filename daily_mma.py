@@ -96,6 +96,65 @@ CLOSE_BAND = 0.05
 MIN_EDGE = BF.MIN_EDGE
 
 
+# --- MBM method market (patched) ---
+# The engine already returns a full 6-way method distribution; it was being
+# collapsed to winner+distance by BF.mma_board and never shown or graded.
+#
+# Selection rule is NOT argmax. Argmax picks whichever outcome has the highest
+# base rate, which is decisions, and a decision pick is what you would have
+# guessed with no model at all (measured lift 1.03x over 4,695 fights). Instead
+# post the outcome that departs most from the division base rate, inside the
+# calibrated band, and only if the departure clears METH_LIFT_MIN. Measured
+# 1.86x lift at 1.35x, posting on 9-14% of bouts. See BOARD.md.
+METH_LO, METH_HI = 0.08, 0.26      # calibrated trust band, see CALIBRATION.md
+METH_LIFT_MIN = 1.35               # volume/signal knob; 1.20 -> ~44% posting at 1.53x
+METH_CLASSES = ("A_KO", "A_SUB", "A_DEC", "B_KO", "B_SUB", "B_DEC")
+
+
+def _meth_base_rates(Dall, tr):
+    """Division x scheduled-rounds method base rates from the training slice."""
+    d = Dall.loc[tr]
+    d = d[d.m.isin(["KO", "TKO", "SUB", "DEC"])] if "m" in d.columns else d
+    out = {}
+    if "m" not in d.columns:
+        return out, (0.32, 0.19, 0.49)
+    mm = d.m.replace({"TKO": "KO"})
+    g = mm.value_counts(normalize=True)
+    glob = (float(g.get("KO", .32)), float(g.get("SUB", .19)),
+            max(1.0 - float(g.get("KO", .32)) - float(g.get("SUB", .19)), 1e-6))
+    if "wt" in d.columns and "sched" in d.columns:
+        for (wt, sc), grp in d.groupby(["wt", "sched"]):
+            if len(grp) >= 40:
+                v = grp.m.replace({"TKO": "KO"}).value_counts(normalize=True)
+                ko, sb = float(v.get("KO", .32)), float(v.get("SUB", .19))
+                out[(wt, int(sc))] = (ko, sb, max(1.0 - ko - sb, 1e-6))
+    return out, glob
+
+
+def _meth_pick(r, base_tbl, glob, lift_min=METH_LIFT_MIN):
+    """Return (pick_or_None, best_lift). pick is (label, p, base, lift)."""
+    P = np.array([r.p_a_ko, r.p_a_sub, r.p_a_dec,
+                  r.p_b_ko, r.p_b_sub, r.p_b_dec], dtype=float)
+    s = P.sum()
+    if not np.isfinite(s) or s <= 0:
+        return None, 0.0
+    P = P / s
+    pa = float(r.p_win_a)
+    ko, sb, dc = base_tbl.get((r.wt, int(r.sched)), glob)
+    B = np.array([ko * pa, sb * pa, dc * pa,
+                  ko * (1 - pa), sb * (1 - pa), dc * (1 - pa)], dtype=float)
+    B = B / B.sum()
+    lift = np.where((P >= METH_LO) & (P <= METH_HI), P / np.maximum(B, 1e-9), -1.0)
+    j = int(lift.argmax())
+    best = float(max(lift.max(), 0.0))
+    if lift[j] < lift_min:
+        return None, best
+    cls = METH_CLASSES[j]
+    who = r.A if cls.startswith("A_") else r.B
+    return (f"{who} by {cls.split('_')[1]}", float(P[j]), float(B[j]), float(lift[j])), best
+# --- end MBM method market ---
+
+
 def preflight():
     """Fail loudly and usefully if a committed data file is missing. The import guard in
     the workflow cannot see this, because these are read at run time, not import time."""
@@ -281,6 +340,7 @@ def run(today_str):
     Dall = E.build(P, A, CFG)
     tr = (Dall.date.dt.year <= TRAIN_THROUGH) & (~Dall.pending)
     heads = E.fit_heads(Dall, tr, C)
+    _meth_base, _meth_glob = _meth_base_rates(Dall, tr)
 
     alerts, rows = [], []
     os.makedirs(LOGS, exist_ok=True)
@@ -341,6 +401,14 @@ def run(today_str):
                 print(f"  ML   {fav} {pf:.3f}  -> needs {min_odds(pf):.2f}{thin_note}")
             print(f"  DIST goes the distance {r.p_distance:.3f} -> needs {min_odds(r.p_distance):.2f}"
                   f"  | inside {1-r.p_distance:.3f} -> needs {min_odds(1-r.p_distance):.2f}")
+            meth, _mbest = _meth_pick(r, _meth_base, _meth_glob)
+            if meth:
+                _mlbl, _mp, _mb, _mlift = meth
+                print(f"  METH {_mlbl} {_mp:.3f} -> needs {min_odds(_mp):.2f}"
+                      f"  (base {_mb:.3f}, {_mlift:.2f}x)")
+            else:
+                # Always emit a line. Silence cannot be told apart from an unapplied patch.
+                print(f"  METH no edge (best {_mbest:.2f}x, need {METH_LIFT_MIN:.2f}x)")
             combo = BF.mma_board(r.p_a_ko, r.p_a_sub, r.p_a_dec,
                                  r.p_b_ko, r.p_b_sub, r.p_b_dec, r.A, r.B)
             if close_display:
@@ -352,12 +420,26 @@ def run(today_str):
                 # Leading indent so notify renders it as subtext, not a plain-text line that
                 # reads like a header.
                 combo = ["  too close to call"] + dist_lines
+            # close_display suppresses the WINNER market only. The method pick's lift is
+            # computed against a base that also carries p_win_a, so the winner lean cancels
+            # and the lift measures the method departure on its own. A coin-flip moneyline
+            # does not make "A by SUB at 1.8x its base rate" meaningless.
+            if meth and n_min >= ADEQ_MIN_BOUTS:
+                combo = list(combo) + [
+                    f"{_mlbl}  {_mp*100:.1f}%  find {1/_mp:.2f} / "
+                    f"{BF.american(_mp)} or better"]
             for ln in combo:
                 print("  " + ln)
+            b.loc[b.fight_id == r.fight_id, "meth_pick"] = meth[0] if meth else None
+            b.loc[b.fight_id == r.fight_id, "meth_p"] = meth[1] if meth else np.nan
+            b.loc[b.fight_id == r.fight_id, "meth_base"] = meth[2] if meth else np.nan
             rows.append({"date": r.date, "game": f"{r.A} vs {r.B}",
                          "pick": ("too close to call" if close_display else fav),
                          "p": pf, "fight_id": r.fight_id, "combo": combo,
                          "n_min": n_min, "close": bool(r.close)})
+        for _c in ("meth_pick", "meth_p", "meth_base"):
+            if _c not in log.columns:
+                log[_c] = np.nan
         keep = [c for c in log.columns if c in b.columns]
         log = pd.concat([log[~log.fight_id.isin(b.fight_id)], b[keep]], ignore_index=True)
     else:
@@ -498,6 +580,19 @@ def run(today_str):
             pd_ = np.clip(dd.p_distance.values.astype(float), 1e-6, 1-1e-6)
             print(f"  distance : LL={log_loss(yd, pd_):.4f}  base="
                   f"{log_loss(yd, np.full(len(yd), yd.mean())):.4f}")
+        # method market: graded only on rows where a pick was actually posted
+        if "meth_pick" in dec.columns:
+            dm = dec[dec.meth_pick.notna() & dec.meth_hit.notna()]
+            if len(dm) >= 30:
+                ym = dm.meth_hit.astype(int).values
+                pm = np.clip(dm.meth_p.values.astype(float), 1e-6, 1-1e-6)
+                bm = np.clip(dm.meth_base.values.astype(float), 1e-6, 1-1e-6)
+                print(f"  method   : LL={log_loss(ym, pm):.4f}  "
+                      f"base={log_loss(ym, bm):.4f}  "
+                      f"pred={pm.mean():.3f}  hit={ym.mean():.3f}  "
+                      f"lift={ym.mean()/max(bm.mean(),1e-9):.2f}x  n={len(ym)}")
+                if ym.mean() + 0.02 < pm.mean():
+                    alerts.append("MMA method (running hot)")
         w = dec.tail(200)
         if len(w) >= 200:
             yy = w.result.astype(int).values
