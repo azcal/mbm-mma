@@ -1,0 +1,7 @@
+# Fighter A|Fighter B|Division|Rounds
+Gerald Meerschaert|Brad Tavares|Middleweight|5
+Charles Oliveira|Dan Hooker|Lightweight|3
+Derrick Lewis|Marcin Tybura|Heavyweight|3
+Sean Strickland|Kelvin Gastelum|Middleweight|3
+Angela Hill|Loopy Godinez|Women's Strawweight|3
+Islam Dulatov|Vanilto Antunes|Welterweight|3
