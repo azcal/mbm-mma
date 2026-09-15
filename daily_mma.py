@@ -298,6 +298,22 @@ def run(today_str):
     # the graded log's fight_ids rather than the results store.
     _graded_ids = (set(log.loc[log.result.notna(), "fight_id"].astype(str))
                    if "result" in log.columns else set())
+    # A fight ESPN still lists as pregame cannot have a real result. When the log holds one
+    # anyway, the earlier grade came from the nearest-name matcher pairing this bout with a
+    # different fight (the same fighter's previous bout, a namesake, a rescheduled card).
+    # Un-grade it and say so, rather than refusing the whole board; the true result grades
+    # normally once the bout is fought. 2026-09-15: fight 401903509 tripped this.
+    if len(up):
+        _regraded = [fid for fid in up.fight_id.astype(str) if fid in _graded_ids]
+        if _regraded:
+            _m = log.fight_id.astype(str).isin(_regraded)
+            for _c in ("result", "went_dist", "meth_hit", "close"):
+                if _c in log.columns:
+                    log.loc[_m, _c] = pd.NA
+            _graded_ids -= set(_regraded)
+            for _r in log.loc[_m].itertuples():
+                print(f"UN-GRADED: {_r.fight_id} {_r.A} vs {_r.B} ({_r.date}) still pregame on ESPN; "
+                      f"earlier grade was a false name match and has been cleared")
     chk.pregame_only(up.to_dict("records") if len(up) else [],
                      history_ids=_graded_ids, id_key="fight_id")
 
