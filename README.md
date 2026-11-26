@@ -58,3 +58,22 @@ Draws, no-contests and DQs are 2.9% of bouts and grade as pushes.
 
 Rebuild from scratch: `python mma_rebuild_v1.py` (tunes on the development window, rewrites
 `spec.json`, and reopens the holdout, so only run it deliberately).
+
+## Do not trust a backtest that can see who has a birth date on file (2026-11-26)
+
+`data/attrs.csv` was pulled once, in July 2026, from the roster as it stood then. A fighter
+still on the roster in 2026 is a fighter who kept winning, so "this fighter has a date of
+birth on file" is information from the future for any fight before the pull. Where only one
+of the two had an age on file, that fighter won 70.1% of the time in 2024 and 62.7% in 2025.
+In 2026, the first year the file could not have known about, it was 52.0%.
+
+The live winner head is a logistic on linear age terms, with a missing age filled at 30, so
+it cannot isolate that flag and its 2026 numbers are clean (0.6624 with the age terms,
+0.6633 without). Anything that can split on "age is exactly 30" can. A gradient-boosted
+version of this head scored 0.023 and 0.014 better than the live model on 2024 and 2025 and
+0.009 worse on 2026, and all of the gain was this flag. It was not adopted.
+
+If attributes are ever refreshed or extended, either stamp each row with the date it was
+collected and use it only for fights after that date, or judge the change on fights after
+the pull only. The "+0.0082 for age" quoted above was measured on years the file could see;
+on 2026 the age terms are worth about +0.001.
